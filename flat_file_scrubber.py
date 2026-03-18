@@ -1,0 +1,1201 @@
+"""
+Flat File Scrubbing Workflow - Streamlit Application
+Based on SFCOE workflow by Matthew.Kelly (Jan 26, 2026)
+"""
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import io
+import os
+import re
+import glob
+import json
+import smtplib
+import imaplib
+import email as email_lib
+import requests
+from datetime import datetime
+from pathlib import Path
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
+
+# ──────────────────────────────────────────────
+# PAGE CONFIG
+# ──────────────────────────────────────────────
+st.set_page_config(
+    page_title="Flat File Scrubber",
+    page_icon="🧹",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ──────────────────────────────────────────────
+# CUSTOM CSS
+# ──────────────────────────────────────────────
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Syne:wght@400;600;800&display=swap');
+
+html, body, [class*="css"] {
+    font-family: 'Syne', sans-serif;
+}
+code, pre, .stCode {
+    font-family: 'JetBrains Mono', monospace !important;
+}
+
+/* Dark industrial theme */
+.stApp {
+    background-color: #0e1117;
+    color: #e2e8f0;
+}
+
+/* Sidebar */
+[data-testid="stSidebar"] {
+    background-color: #161b27;
+    border-right: 1px solid #2d3748;
+}
+
+/* Metric cards */
+[data-testid="stMetric"] {
+    background: #1a2035;
+    border: 1px solid #2d3748;
+    border-radius: 8px;
+    padding: 12px 16px;
+}
+
+/* Section headers */
+.section-header {
+    font-family: 'Syne', sans-serif;
+    font-weight: 800;
+    font-size: 1.1rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: #63b3ed;
+    padding: 6px 0 2px 0;
+    border-bottom: 2px solid #2b6cb0;
+    margin-bottom: 12px;
+}
+
+/* Status badge */
+.badge-clean   { background:#276749; color:#c6f6d5; padding:2px 10px; border-radius:12px; font-size:0.78rem; font-weight:700; }
+.badge-dupes   { background:#744210; color:#fefcbf; padding:2px 10px; border-radius:12px; font-size:0.78rem; font-weight:700; }
+.badge-bad     { background:#63171b; color:#fed7d7; padding:2px 10px; border-radius:12px; font-size:0.78rem; font-weight:700; }
+.badge-sf      { background:#2a4365; color:#bee3f8; padding:2px 10px; border-radius:12px; font-size:0.78rem; font-weight:700; }
+
+/* Warning / info boxes */
+.info-box {
+    background: #1e3a5f;
+    border-left: 4px solid #63b3ed;
+    padding: 10px 14px;
+    border-radius: 4px;
+    font-size: 0.88rem;
+    margin: 8px 0;
+}
+.warn-box {
+    background: #3d2408;
+    border-left: 4px solid #ed8936;
+    padding: 10px 14px;
+    border-radius: 4px;
+    font-size: 0.88rem;
+    margin: 8px 0;
+}
+
+/* Dataframe tweaks */
+[data-testid="stDataFrame"] { border: 1px solid #2d3748; border-radius: 6px; }
+
+/* Button row */
+.stButton > button {
+    border-radius: 6px;
+    font-family: 'Syne', sans-serif;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# ──────────────────────────────────────────────
+# SUPPORTED OBJECTS
+# ──────────────────────────────────────────────
+SUPPORTED_OBJECTS = [
+    "Account",
+    "Contact",
+    "Lead",
+    "Opportunity",
+    "Account to Account Relationship",
+    "Account to Contact Relationship",
+    "User",
+    "Snowflake Table - DEFAULT",
+]
+
+REQUIRED_FIELDS = {
+    "Account":      ["Name"],
+    "Contact":      ["LastName", "AccountId"],
+    "Lead":         ["LastName", "Company"],
+    "Opportunity":  ["Name", "StageName", "CloseDate", "AccountId"],
+    "Account to Account Relationship": ["ParentId", "ChildId"],
+    "Account to Contact Relationship": ["AccountId", "ContactId"],
+    "User":         ["LastName", "Username", "Email", "ProfileId", "TimeZoneSidKey", "LocaleSidKey", "EmailEncodingKey", "LanguageLocaleKey"],
+    "Snowflake Table - DEFAULT": [],
+}
+
+COMMON_SPECIAL_CHARS = r'[\*\n\^\$\#\@\!\%\&\(\)\[\]\{\}\<\>\?\/\\|`~"\';:]'
+
+# ──────────────────────────────────────────────
+# SESSION STATE INIT
+# ──────────────────────────────────────────────
+def init_state():
+    defaults = {
+        "raw_df":           None,
+        "clean_df":         None,
+        "dupes_df":         pd.DataFrame(),
+        "bad_df":           pd.DataFrame(),
+        "sf_dupes_df":      pd.DataFrame(),
+        "job_name":         "",
+        "object_type":      "",
+        "has_header":       True,
+        "sf_id_col":        None,
+        "required_cols":    [],
+        "step":             0,          # workflow step tracker
+        "history":          [],         # undo stack
+        "col_renames":      {},
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+init_state()
+
+# ──────────────────────────────────────────────
+# HELPERS
+# ──────────────────────────────────────────────
+def today_str():
+    return datetime.now().strftime("%d%m%Y")
+
+def push_history(label: str):
+    """Save current clean_df to undo history."""
+    if st.session_state.clean_df is not None:
+        st.session_state.history.append(
+            (label, st.session_state.clean_df.copy())
+        )
+        if len(st.session_state.history) > 20:
+            st.session_state.history.pop(0)
+
+def undo():
+    if st.session_state.history:
+        label, df = st.session_state.history.pop()
+        st.session_state.clean_df = df
+        st.success(f"↩ Undone: {label}")
+
+def df_metrics():
+    c = len(st.session_state.clean_df) if st.session_state.clean_df is not None else 0
+    d = len(st.session_state.dupes_df)
+    b = len(st.session_state.bad_df)
+    s = len(st.session_state.sf_dupes_df)
+    return c, d, b, s
+
+def csv_bytes(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False).encode("utf-8")
+
+# ──────────────────────────────────────────────
+# SIDEBAR — JOB SETUP & NAVIGATION
+# ──────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("### 🧹 Flat File Scrubber")
+    st.caption("SFCOE · Data Steward Toolkit")
+    st.divider()
+
+    # Job name
+    short_desc = st.text_input("Job Short Description (e.g. 'Apollo Load')", value="")
+    if short_desc:
+        jn = f"{short_desc.replace(' ', '_')}_{today_str()}"
+        st.session_state.job_name = jn
+        st.code(jn, language=None)
+
+    # Object selector
+    obj = st.selectbox("Salesforce / Target Object", SUPPORTED_OBJECTS)
+    st.session_state.object_type = obj
+
+    st.divider()
+
+    # Workflow step indicator
+    steps = [
+        "① Ingest", "② Inspect", "③ Drop Columns",
+        "④ Null Handling", "⑤ Type Casting", "⑥ Split Columns",
+        "⑦ Special Chars", "⑧ Duplicates", "⑨ Incomplete",
+        "⑩ SF Dupes", "⑪ Export",
+    ]
+    st.markdown("**Workflow Steps**")
+    for i, s in enumerate(steps):
+        if i == st.session_state.step:
+            st.markdown(f"**→ {s}**")
+        else:
+            st.caption(s)
+
+    st.divider()
+
+    # Metrics
+    c, d, b, s_d = df_metrics()
+    st.markdown("**DataFrame Counts**")
+    col1, col2 = st.columns(2)
+    col1.metric("✅ Clean",     c)
+    col1.metric("⚠️ Bad",       b)
+    col2.metric("🔁 Dupes",     d)
+    col2.metric("☁️ SF Dupes",  s_d)
+
+    st.divider()
+    if st.button("↩ Undo Last Operation"):
+        undo()
+    if st.button("🔄 Reset Everything"):
+        for k in list(st.session_state.keys()):
+            del st.session_state[k]
+        st.rerun()
+
+# ──────────────────────────────────────────────
+# MAIN AREA — TABS
+# ──────────────────────────────────────────────
+tabs = st.tabs([
+    "📥 Ingest",
+    "🔍 Inspect",
+    "✂️ Drop / Rename",
+    "🕳 Null Handling",
+    "🔢 Types & Splits",
+    "🔡 Special Chars",
+    "🔁 Duplicates",
+    "❌ Incomplete",
+    "☁️ SF Dupe Check",
+    "📤 Export",
+    "📋 Data Frames",
+])
+
+# ──────────────────────────────────────────────
+# INGEST HELPERS
+# ──────────────────────────────────────────────
+def load_dataframe(file_like, filename: str, has_header: bool):
+    """Read a CSV-like source into clean_df and raw_df."""
+    if has_header:
+        df = pd.read_csv(file_like)
+    else:
+        df = pd.read_csv(file_like, header=None)
+        df.columns = [f"col_{i}" for i in range(len(df.columns))]
+    jn = st.session_state.job_name or "job"
+    st.session_state.raw_df   = df.copy()
+    st.session_state.clean_df = df.copy()
+    st.session_state.step     = 1
+    return df, filename, jn
+
+
+def fetch_csv_from_imap(host, port, use_ssl, username, password,
+                        folder, subject_filter, mark_seen):
+    """
+    Connect to an IMAP mailbox, find emails matching subject_filter,
+    and return a list of (filename, bytes) tuples for every CSV attachment found.
+    """
+    attachments = []
+    try:
+        if use_ssl:
+            M = imaplib.IMAP4_SSL(host, port)
+        else:
+            M = imaplib.IMAP4(host, port)
+            M.starttls()
+        M.login(username, password)
+        M.select(folder)
+
+        search_criterion = "UNSEEN" if not mark_seen else "ALL"
+        if subject_filter.strip():
+            search_criterion = f'({search_criterion} SUBJECT "{subject_filter}")'
+
+        typ, data = M.search(None, search_criterion)
+        msg_ids = data[0].split()
+
+        for msg_id in msg_ids:
+            typ2, raw = M.fetch(msg_id, "(RFC822)")
+            msg = email_lib.message_from_bytes(raw[0][1])
+
+            for part in msg.walk():
+                ct   = part.get_content_type()
+                disp = str(part.get("Content-Disposition", ""))
+                fname = part.get_filename()
+
+                if fname and (fname.lower().endswith(".csv") or
+                              fname.lower().endswith(".txt") or
+                              ct in ("text/csv", "text/plain", "application/octet-stream")):
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        attachments.append((fname, payload))
+
+            if mark_seen:
+                M.store(msg_id, "+FLAGS", "\\Seen")
+
+        M.logout()
+    except Exception as e:
+        raise RuntimeError(f"IMAP error: {e}")
+    return attachments
+
+
+# ══════════════════════════════════════════════
+# TAB 0 — INGEST
+# ══════════════════════════════════════════════
+with tabs[0]:
+    st.markdown('<div class="section-header">File Ingestion</div>', unsafe_allow_html=True)
+
+    if st.session_state.clean_df is not None:
+        st.markdown('<div class="info-box">✅ File already loaded. Switch to another tab to continue, '
+                    'or re-ingest below to replace it.</div>', unsafe_allow_html=True)
+
+    has_header = st.checkbox("File has a header row", value=True, key="ingest_has_header")
+    st.session_state.has_header = has_header
+
+    ingest_mode = st.radio(
+        "Intake Method",
+        ["📁 Browser Upload", "🗂 File Path / Directory", "📧 Email (IMAP)"],
+        horizontal=True,
+        key="ingest_mode",
+    )
+
+    # ─────────────────────────────────────────
+    # MODE A — Browser upload (original)
+    # ─────────────────────────────────────────
+    if ingest_mode == "📁 Browser Upload":
+        uploaded = st.file_uploader("Upload CSV File", type=["csv", "txt"], key="browser_upload")
+        if uploaded:
+            try:
+                df, fname, jn = load_dataframe(uploaded, uploaded.name, has_header)
+                st.markdown(
+                    f'<div class="info-box">📂 Loaded <strong>{fname}</strong> → '
+                    f'<code>{jn}.csv</code><br>'
+                    f'Shape: <strong>{df.shape[0]:,} rows × {df.shape[1]} cols</strong></div>',
+                    unsafe_allow_html=True,
+                )
+                st.dataframe(df.head(10), use_container_width=True)
+            except Exception as e:
+                st.error(f"Error reading file: {e}")
+
+    # ─────────────────────────────────────────
+    # MODE B — File path / directory picker
+    # ─────────────────────────────────────────
+    elif ingest_mode == "🗂 File Path / Directory":
+        st.markdown(
+            '<div class="info-box">Enter an absolute file path to load a single CSV, '
+            'or a directory path to browse all CSVs inside it.</div>',
+            unsafe_allow_html=True,
+        )
+
+        path_input = st.text_input(
+            "File or Directory Path",
+            placeholder="/data/imports/  or  /data/imports/accounts.csv",
+            key="path_input",
+        )
+
+        selected_file = None
+
+        if path_input:
+            p = Path(path_input.strip())
+
+            if p.is_file():
+                selected_file = str(p)
+                st.success(f"File found: `{p.name}`")
+
+            elif p.is_dir():
+                csv_files = sorted(
+                    glob.glob(str(p / "*.csv")) + glob.glob(str(p / "*.txt"))
+                )
+                if not csv_files:
+                    st.warning("No .csv or .txt files found in that directory.")
+                else:
+                    labels = [Path(f).name for f in csv_files]
+                    choice = st.selectbox(
+                        f"{len(csv_files)} file(s) found — select one to load",
+                        options=labels,
+                        key="dir_file_choice",
+                    )
+                    selected_file = csv_files[labels.index(choice)]
+
+                    # Show directory listing
+                    with st.expander("📂 Full directory listing"):
+                        for f in csv_files:
+                            size_kb = Path(f).stat().st_size / 1024
+                            st.caption(f"{Path(f).name}  —  {size_kb:.1f} KB  "
+                                       f"  modified: {datetime.fromtimestamp(Path(f).stat().st_mtime).strftime('%Y-%m-%d %H:%M')}")
+            else:
+                if path_input:
+                    st.error("Path not found. Check that it exists and is accessible by this server.")
+
+        if selected_file:
+            if st.button("📥 Load Selected File", key="load_path_btn"):
+                try:
+                    with open(selected_file, "rb") as fh:
+                        df, fname, jn = load_dataframe(fh, Path(selected_file).name, has_header)
+                    st.markdown(
+                        f'<div class="info-box">📂 Loaded <strong>{fname}</strong> → '
+                        f'<code>{jn}.csv</code><br>'
+                        f'Shape: <strong>{df.shape[0]:,} rows × {df.shape[1]} cols</strong></div>',
+                        unsafe_allow_html=True,
+                    )
+                    st.dataframe(df.head(10), use_container_width=True)
+                except Exception as e:
+                    st.error(f"Error reading file: {e}")
+
+    # ─────────────────────────────────────────
+    # MODE C — Email (IMAP)
+    # ─────────────────────────────────────────
+    elif ingest_mode == "📧 Email (IMAP)":
+        st.markdown(
+            '<div class="info-box">'
+            'Connect to an IMAP mailbox and pull CSV attachments directly from emails. '
+            'The app will scan for unread messages (or filter by subject) and extract '
+            'any attached .csv files for you to select and load.<br><br>'
+            '💡 For Gmail, use an <strong>App Password</strong> '
+            '(<a href="https://myaccount.google.com/apppasswords" target="_blank" '
+            'style="color:#63b3ed">myaccount.google.com/apppasswords</a>) '
+            'and set the host to <code>imap.gmail.com</code>.<br>'
+            'For Outlook/Office 365, use <code>outlook.office365.com</code>.'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+        with st.expander("🔐 IMAP Connection Settings", expanded=True):
+            ec1, ec2 = st.columns(2)
+            imap_host    = ec1.text_input("IMAP Host",     value="imap.gmail.com",     key="imap_host")
+            imap_port    = ec2.number_input("Port",        value=993, step=1,           key="imap_port")
+            imap_ssl     = ec1.checkbox("Use SSL",         value=True,                  key="imap_ssl")
+            imap_folder  = ec2.text_input("Mailbox Folder", value="INBOX",             key="imap_folder")
+            imap_user    = ec1.text_input("Email Address",                              key="imap_user")
+            imap_pass    = ec2.text_input("Password / App Password", type="password",   key="imap_pass")
+            imap_subject = st.text_input(
+                "Subject filter (optional — leave blank for all unread)",
+                placeholder="Flat File",
+                key="imap_subject",
+            )
+            imap_mark    = st.checkbox(
+                "Search ALL mail (not just unread), and mark retrieved messages as read",
+                value=False,
+                key="imap_mark",
+            )
+
+        if st.button("📬 Check Mailbox for CSV Attachments", key="imap_fetch_btn"):
+            if not imap_user or not imap_pass:
+                st.error("Enter email address and password.")
+            else:
+                with st.spinner("Connecting to mailbox…"):
+                    try:
+                        found = fetch_csv_from_imap(
+                            host=imap_host,
+                            port=int(imap_port),
+                            use_ssl=imap_ssl,
+                            username=imap_user,
+                            password=imap_pass,
+                            folder=imap_folder,
+                            subject_filter=imap_subject,
+                            mark_seen=imap_mark,
+                        )
+                        st.session_state["imap_attachments"] = found
+                        if found:
+                            st.success(f"Found {len(found)} CSV attachment(s).")
+                        else:
+                            st.warning("No CSV attachments found matching your criteria.")
+                    except RuntimeError as e:
+                        st.error(str(e))
+
+        # Attachment selector
+        if st.session_state.get("imap_attachments"):
+            attachments = st.session_state["imap_attachments"]
+            att_names   = [a[0] for a in attachments]
+
+            selected_att = st.selectbox(
+                "Select attachment to load",
+                options=att_names,
+                key="imap_att_select",
+            )
+
+            att_bytes = attachments[att_names.index(selected_att)][1]
+
+            # Preview raw bytes
+            with st.expander("👀 Raw preview (first 5 lines)"):
+                lines = att_bytes.decode("utf-8", errors="replace").splitlines()[:5]
+                for line in lines:
+                    st.code(line)
+
+            if st.button("📥 Load This Attachment", key="imap_load_btn"):
+                try:
+                    df, fname, jn = load_dataframe(
+                        io.BytesIO(att_bytes), selected_att, has_header
+                    )
+                    # Clear attachment cache after successful load
+                    st.session_state["imap_attachments"] = []
+                    st.markdown(
+                        f'<div class="info-box">📧 Loaded from email: <strong>{fname}</strong> → '
+                        f'<code>{jn}.csv</code><br>'
+                        f'Shape: <strong>{df.shape[0]:,} rows × {df.shape[1]} cols</strong></div>',
+                        unsafe_allow_html=True,
+                    )
+                    st.dataframe(df.head(10), use_container_width=True)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error parsing attachment: {e}")
+
+# ══════════════════════════════════════════════
+# TAB 1 — INSPECT
+# ══════════════════════════════════════════════
+with tabs[1]:
+    st.markdown('<div class="section-header">Dataset Inspection</div>', unsafe_allow_html=True)
+
+    if st.session_state.clean_df is None:
+        st.warning("No data loaded yet. Go to **Ingest** tab first.")
+    else:
+        df = st.session_state.clean_df
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Rows",    f"{df.shape[0]:,}")
+        c2.metric("Columns", df.shape[1])
+        c3.metric("Memory",  f"{df.memory_usage(deep=True).sum() / 1024:.1f} KB")
+
+        st.subheader("Column Info & Data Types")
+        info_df = pd.DataFrame({
+            "Column":   df.columns,
+            "Dtype":    [str(df[c].dtype) for c in df.columns],
+            "Non-Null": [df[c].notna().sum() for c in df.columns],
+            "Null %":   [(df[c].isna().sum() / len(df) * 100).round(2) for c in df.columns],
+            "Unique":   [df[c].nunique() for c in df.columns],
+            "Sample":   [str(df[c].dropna().iloc[0]) if df[c].notna().any() else "—" for c in df.columns],
+        })
+        st.dataframe(info_df, use_container_width=True, hide_index=True)
+
+        st.subheader("Descriptive Statistics")
+        st.dataframe(df.describe(include="all").T, use_container_width=True)
+
+        st.subheader("Required Fields for Object: " + st.session_state.object_type)
+        req = REQUIRED_FIELDS.get(st.session_state.object_type, [])
+        if req:
+            present = [r for r in req if r in df.columns]
+            missing = [r for r in req if r not in df.columns]
+            if present:
+                st.success(f"Present: {', '.join(present)}")
+            if missing:
+                st.warning(f"Missing from CSV: {', '.join(missing)}")
+        else:
+            st.info("No pre-defined required fields for this object type.")
+
+        # SF ID column
+        st.subheader("Does the dataset contain Salesforce IDs?")
+        sf_cols = ["(None)"] + list(df.columns)
+        sf_id = st.selectbox("Select the Salesforce ID column (if any)", sf_cols)
+        st.session_state.sf_id_col = None if sf_id == "(None)" else sf_id
+
+        # User-defined required fields
+        st.subheader("Mark Required Fields from Incoming CSV")
+        req_cols = st.multiselect(
+            "Which columns are required (must not be blank)?",
+            options=list(df.columns),
+            default=st.session_state.required_cols,
+        )
+        st.session_state.required_cols = req_cols
+
+        if st.button("✅ Confirm Inspection", key="confirm_inspect"):
+            st.session_state.step = 2
+            st.success("Inspection confirmed. Proceed to **Drop / Rename** tab.")
+
+# ══════════════════════════════════════════════
+# TAB 2 — DROP / RENAME COLUMNS
+# ══════════════════════════════════════════════
+with tabs[2]:
+    st.markdown('<div class="section-header">Drop & Rename Columns</div>', unsafe_allow_html=True)
+
+    if st.session_state.clean_df is None:
+        st.warning("No data loaded.")
+    else:
+        df = st.session_state.clean_df
+
+        # Null % preview to help decide
+        null_pct = (df.isnull().sum() * 100 / len(df)).round(1)
+        null_df  = null_pct.reset_index()
+        null_df.columns = ["Column", "Null %"]
+        st.caption("Null % per column (to help decide what to drop):")
+        st.dataframe(null_df, use_container_width=True, hide_index=True)
+
+        st.subheader("Drop Columns")
+        cols_to_drop = st.multiselect("Select columns to drop", options=list(df.columns))
+
+        if cols_to_drop and st.button("🗑 Drop Selected Columns"):
+            push_history("Drop columns")
+            st.session_state.clean_df.drop(columns=cols_to_drop, inplace=True)
+            st.success(f"Dropped: {', '.join(cols_to_drop)}")
+            st.rerun()
+
+        st.subheader("Rename Columns")
+        renames = {}
+        for col in df.columns:
+            new_name = st.text_input(f"Rename '{col}'", value=col, key=f"rename_{col}")
+            if new_name != col:
+                renames[col] = new_name
+
+        if renames and st.button("✏️ Apply Renames"):
+            push_history("Rename columns")
+            st.session_state.clean_df.rename(columns=renames, inplace=True)
+            st.success(f"Renamed {len(renames)} column(s).")
+            st.rerun()
+
+# ══════════════════════════════════════════════
+# TAB 3 — NULL HANDLING
+# ══════════════════════════════════════════════
+with tabs[3]:
+    st.markdown('<div class="section-header">Null & Missing Value Handling</div>', unsafe_allow_html=True)
+
+    if st.session_state.clean_df is None:
+        st.warning("No data loaded.")
+    else:
+        df = st.session_state.clean_df
+        null_pct = (df.isnull().sum() * 100 / len(df)).round(2)
+        cols_with_nulls = null_pct[null_pct > 0].index.tolist()
+
+        if not cols_with_nulls:
+            st.success("🎉 No null values found!")
+        else:
+            st.markdown(f'<div class="warn-box">Found <strong>{len(cols_with_nulls)}</strong> columns with null values.</div>',
+                        unsafe_allow_html=True)
+
+            for col in cols_with_nulls:
+                with st.expander(f"📊 {col}  —  {null_pct[col]:.1f}% null"):
+                    n_null = df[col].isna().sum()
+                    st.write(f"Null count: **{n_null:,}** / {len(df):,}")
+                    unique_vals = df[col].dropna().unique()[:30]
+                    st.write("Sample unique values:", list(unique_vals))
+
+                    action = st.radio(
+                        f"Action for '{col}'",
+                        ["Leave as-is", "Fill with signal value", "Fill with mean/median/mode",
+                         "Drop rows where null", "Drop this column"],
+                        key=f"null_action_{col}",
+                        horizontal=True,
+                    )
+
+                    if action == "Fill with signal value":
+                        sig = st.text_input(f"Signal value for '{col}'", value="-1", key=f"sig_{col}")
+                        if st.button(f"Apply fill → '{col}'", key=f"apply_fill_{col}"):
+                            push_history(f"Fill null {col}")
+                            # try numeric cast
+                            try:
+                                val = float(sig) if "." in sig else int(sig)
+                            except ValueError:
+                                val = sig
+                            st.session_state.clean_df[col].fillna(val, inplace=True)
+                            st.success(f"Filled nulls in '{col}' with {val}")
+                            st.rerun()
+
+                    elif action == "Fill with mean/median/mode":
+                        stat = st.selectbox("Statistic", ["mean", "median", "mode"], key=f"stat_{col}")
+                        if st.button(f"Apply stat fill → '{col}'", key=f"apply_stat_{col}"):
+                            push_history(f"Stat fill {col}")
+                            cdf = st.session_state.clean_df
+                            if stat == "mean":
+                                cdf[col].fillna(cdf[col].mean(), inplace=True)
+                            elif stat == "median":
+                                cdf[col].fillna(cdf[col].median(), inplace=True)
+                            elif stat == "mode":
+                                cdf[col].fillna(cdf[col].mode()[0], inplace=True)
+                            st.success(f"Filled nulls in '{col}' with {stat}")
+                            st.rerun()
+
+                    elif action == "Drop rows where null":
+                        if st.button(f"Drop rows where '{col}' is null", key=f"drop_null_{col}"):
+                            push_history(f"Drop null rows {col}")
+                            before = len(st.session_state.clean_df)
+                            st.session_state.clean_df.dropna(subset=[col], inplace=True)
+                            after = len(st.session_state.clean_df)
+                            st.success(f"Dropped {before - after:,} rows.")
+                            st.rerun()
+
+                    elif action == "Drop this column":
+                        if st.button(f"Drop column '{col}'", key=f"drop_col_{col}"):
+                            push_history(f"Drop column {col}")
+                            st.session_state.clean_df.drop(columns=[col], inplace=True)
+                            st.success(f"Dropped column '{col}'")
+                            st.rerun()
+
+# ══════════════════════════════════════════════
+# TAB 4 — TYPES & SPLITS
+# ══════════════════════════════════════════════
+with tabs[4]:
+    st.markdown('<div class="section-header">Data Type Casting & Column Splitting</div>', unsafe_allow_html=True)
+
+    if st.session_state.clean_df is None:
+        st.warning("No data loaded.")
+    else:
+        df = st.session_state.clean_df
+
+        st.subheader("Type Casting")
+        dtype_map = {c: str(df[c].dtype) for c in df.columns}
+        type_options = ["object", "int64", "float64", "bool", "datetime64[ns]", "category", "string"]
+
+        changes = {}
+        cols = list(df.columns)
+        batch = [cols[i:i+3] for i in range(0, len(cols), 3)]
+        for row in batch:
+            rcols = st.columns(len(row))
+            for ci, col in enumerate(row):
+                cur = dtype_map[col]
+                sel = rcols[ci].selectbox(f"`{col}` [{cur}]", type_options,
+                                          index=type_options.index(cur) if cur in type_options else 0,
+                                          key=f"dtype_{col}")
+                if sel != cur:
+                    changes[col] = sel
+
+        if changes and st.button("🔄 Apply Type Conversions"):
+            push_history("Type cast")
+            cdf = st.session_state.clean_df
+            errors = []
+            for col, new_type in changes.items():
+                try:
+                    if new_type == "datetime64[ns]":
+                        cdf[col] = pd.to_datetime(cdf[col])
+                    else:
+                        cdf[col] = cdf[col].astype(new_type)
+                except Exception as e:
+                    errors.append(f"{col}: {e}")
+            if errors:
+                st.warning("Some conversions failed:\n" + "\n".join(errors))
+            else:
+                st.success(f"Converted {len(changes)} column(s).")
+            st.rerun()
+
+        st.divider()
+        st.subheader("Split a Column")
+        split_col = st.selectbox("Column to split", ["(none)"] + list(df.columns), key="split_col_sel")
+        if split_col != "(none)":
+            delimiter = st.text_input("Delimiter (e.g.  ' ', ',', '-', '/')", value=" ", key="split_delim")
+            new_col_a = st.text_input("Name for first part", value=f"{split_col}_1", key="split_a")
+            new_col_b = st.text_input("Name for second part", value=f"{split_col}_2", key="split_b")
+            keep_orig = st.checkbox("Keep original column", value=False, key="split_keep")
+
+            if st.button("✂️ Split Column"):
+                push_history(f"Split {split_col}")
+                cdf = st.session_state.clean_df
+                try:
+                    cdf[new_col_a] = cdf[split_col].str.split(delimiter, expand=True)[0]
+                    cdf[new_col_b] = cdf[split_col].str.split(delimiter, expand=True)[1]
+                    if not keep_orig:
+                        cdf.drop(columns=[split_col], inplace=True)
+                    st.success(f"Split '{split_col}' → '{new_col_a}' + '{new_col_b}'")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Split failed: {e}")
+
+# ══════════════════════════════════════════════
+# TAB 5 — SPECIAL CHARACTERS
+# ══════════════════════════════════════════════
+with tabs[5]:
+    st.markdown('<div class="section-header">Special Character Scrubbing</div>', unsafe_allow_html=True)
+
+    if st.session_state.clean_df is None:
+        st.warning("No data loaded.")
+    else:
+        df = st.session_state.clean_df
+        str_cols = df.select_dtypes(include="object").columns.tolist()
+
+        st.markdown(f'<div class="info-box">Default pattern scanned: <code>{COMMON_SPECIAL_CHARS}</code><br>'
+                    f'Applies to <strong>{len(str_cols)}</strong> text column(s).</div>', unsafe_allow_html=True)
+
+        custom_pattern = st.text_input("Custom regex pattern (leave blank for default)", value="", key="spec_pattern")
+        pattern = custom_pattern if custom_pattern else COMMON_SPECIAL_CHARS
+
+        cols_to_scrub = st.multiselect("Select columns to scan/scrub", options=str_cols, default=str_cols, key="spec_cols")
+
+        if cols_to_scrub and st.button("🔍 Preview Special Characters Found"):
+            results = {}
+            for col in cols_to_scrub:
+                hits = df[col].dropna().astype(str).str.contains(pattern, regex=True).sum()
+                if hits > 0:
+                    results[col] = hits
+            if results:
+                res_df = pd.DataFrame(list(results.items()), columns=["Column", "Affected Rows"])
+                st.dataframe(res_df, use_container_width=True, hide_index=True)
+            else:
+                st.success("No special characters found in selected columns.")
+
+        replacement = st.text_input("Replace with (blank = remove)", value="", key="spec_replace")
+
+        if cols_to_scrub and st.button("🧹 Scrub Special Characters"):
+            push_history("Scrub special chars")
+            cdf = st.session_state.clean_df
+            total = 0
+            for col in cols_to_scrub:
+                if col in cdf.columns and cdf[col].dtype == object:
+                    before = cdf[col].astype(str).str.contains(pattern, regex=True).sum()
+                    cdf[col] = cdf[col].astype(str).str.replace(pattern, replacement, regex=True)
+                    total += before
+            st.success(f"Scrubbed special characters from {total:,} cell(s) across {len(cols_to_scrub)} column(s).")
+            st.rerun()
+
+        st.divider()
+        st.subheader("Inspect Unique Values in a Column")
+        inspect_col = st.selectbox("Column", ["(none)"] + str_cols, key="inspect_unique_col")
+        if inspect_col != "(none)":
+            uniq = df[inspect_col].unique()[:100]
+            st.write(f"Up to 100 unique values ({df[inspect_col].nunique()} total):")
+            st.write(list(uniq))
+
+# ══════════════════════════════════════════════
+# TAB 6 — DUPLICATES
+# ══════════════════════════════════════════════
+with tabs[6]:
+    st.markdown('<div class="section-header">Duplicate Detection & Removal</div>', unsafe_allow_html=True)
+
+    if st.session_state.clean_df is None:
+        st.warning("No data loaded.")
+    else:
+        df = st.session_state.clean_df
+
+        st.subheader("Submitted / Row-Level Duplicates")
+        dup_cols = st.multiselect(
+            "Check duplicates across which columns? (blank = all columns)",
+            options=list(df.columns),
+            key="dup_cols",
+        )
+        subset = dup_cols if dup_cols else None
+
+        n_dupes = df.duplicated(subset=subset, keep=False).sum()
+        st.metric("Duplicate Rows Found", n_dupes)
+
+        if n_dupes > 0:
+            if st.checkbox("Preview duplicate rows", key="prev_dupes"):
+                st.dataframe(df[df.duplicated(subset=subset, keep=False)].head(50), use_container_width=True)
+
+            keep_opt = st.radio("Which duplicate to keep?", ["first", "last", "none (move ALL)"], horizontal=True, key="keep_opt")
+
+            if st.button("📦 Move Duplicates to Dupes DataFrame"):
+                push_history("Move duplicates")
+                cdf = st.session_state.clean_df
+                keep_val = keep_opt if keep_opt in ["first", "last"] else False
+                dupe_mask = cdf.duplicated(subset=subset, keep=keep_val)
+                dupe_rows = cdf[dupe_mask].copy()
+                st.session_state.dupes_df = pd.concat(
+                    [st.session_state.dupes_df, dupe_rows], ignore_index=True
+                )
+                st.session_state.clean_df = cdf[~dupe_mask].reset_index(drop=True)
+                st.success(f"Moved {len(dupe_rows):,} duplicate rows to **Dupes DataFrame**.")
+                st.rerun()
+        else:
+            st.success("✅ No duplicates found with current column selection.")
+
+# ══════════════════════════════════════════════
+# TAB 7 — INCOMPLETE RECORDS
+# ══════════════════════════════════════════════
+with tabs[7]:
+    st.markdown('<div class="section-header">Incomplete Record Handling</div>', unsafe_allow_html=True)
+
+    if st.session_state.clean_df is None:
+        st.warning("No data loaded.")
+    else:
+        df = st.session_state.clean_df
+        req_cols = st.session_state.required_cols
+
+        if not req_cols:
+            st.markdown('<div class="warn-box">No required columns defined. Set them in the <strong>Inspect</strong> tab.</div>',
+                        unsafe_allow_html=True)
+        else:
+            st.write(f"Required fields: **{', '.join(req_cols)}**")
+            req_present = [c for c in req_cols if c in df.columns]
+            req_missing  = [c for c in req_cols if c not in df.columns]
+
+            if req_missing:
+                st.warning(f"These required columns don't exist in the data: {req_missing}")
+
+            if req_present:
+                incomplete_mask = df[req_present].isnull().any(axis=1)
+                n_bad = incomplete_mask.sum()
+                st.metric("Records missing required fields", n_bad)
+
+                if n_bad > 0:
+                    if st.checkbox("Preview incomplete records", key="prev_bad"):
+                        st.dataframe(df[incomplete_mask].head(50), use_container_width=True)
+
+                    if st.button("📦 Move Incomplete Records to Bad DataFrame"):
+                        push_history("Move incomplete")
+                        cdf = st.session_state.clean_df
+                        bad_rows = cdf[incomplete_mask].copy()
+                        st.session_state.bad_df = pd.concat(
+                            [st.session_state.bad_df, bad_rows], ignore_index=True
+                        )
+                        st.session_state.clean_df = cdf[~incomplete_mask].reset_index(drop=True)
+                        st.success(f"Moved {len(bad_rows):,} incomplete rows to **Bad DataFrame**.")
+                        st.rerun()
+                else:
+                    st.success("✅ All records have required fields.")
+
+# ══════════════════════════════════════════════
+# TAB 8 — SALESFORCE DUPE CHECK
+# ══════════════════════════════════════════════
+with tabs[8]:
+    st.markdown('<div class="section-header">Salesforce / Snowflake Duplicate Check</div>', unsafe_allow_html=True)
+
+    if st.session_state.clean_df is None:
+        st.warning("No data loaded.")
+    else:
+        df = st.session_state.clean_df
+        st.markdown('<div class="info-box">Compare the clean data frame against an existing Salesforce / Snowflake export to identify records that already exist.</div>',
+                    unsafe_allow_html=True)
+
+        sf_ref = st.file_uploader("Upload Salesforce / Snowflake reference CSV", type=["csv"], key="sf_ref_upload")
+
+        if sf_ref:
+            ref_df = pd.read_csv(sf_ref)
+            st.write(f"Reference dataset: {ref_df.shape[0]:,} rows × {ref_df.shape[1]} cols")
+
+            match_col_clean = st.selectbox("Match column in your CSV",      list(df.columns),     key="match_clean")
+            match_col_ref   = st.selectbox("Match column in reference file", list(ref_df.columns), key="match_ref")
+
+            if st.button("🔍 Find SF Duplicates"):
+                ref_vals = set(ref_df[match_col_ref].dropna().astype(str).str.strip())
+                sf_dupe_mask = df[match_col_clean].astype(str).str.strip().isin(ref_vals)
+                n_sf = sf_dupe_mask.sum()
+                st.metric("SF Duplicate Records Found", n_sf)
+
+                if n_sf > 0:
+                    if st.button("📦 Move SF Dupes to SF Dupes DataFrame", key="move_sf"):
+                        push_history("Move SF dupes")
+                        cdf = st.session_state.clean_df
+                        sf_rows = cdf[sf_dupe_mask].copy()
+                        st.session_state.sf_dupes_df = pd.concat(
+                            [st.session_state.sf_dupes_df, sf_rows], ignore_index=True
+                        )
+                        st.session_state.clean_df = cdf[~sf_dupe_mask].reset_index(drop=True)
+                        st.success(f"Moved {len(sf_rows):,} rows to **SF Dupes DataFrame**.")
+                        st.rerun()
+                else:
+                    st.success("✅ No matches found — no SF duplicates detected.")
+
+# ══════════════════════════════════════════════
+# TAB 9 — EXPORT
+# ══════════════════════════════════════════════
+with tabs[9]:
+    st.markdown('<div class="section-header">Export & Load</div>', unsafe_allow_html=True)
+
+    if st.session_state.clean_df is None:
+        st.warning("No data loaded.")
+    else:
+        df = st.session_state.clean_df
+        jn = st.session_state.job_name or "clean_output"
+
+        c, d, b, s_d = df_metrics()
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("✅ Clean Records",       c)
+        m2.metric("🔁 Dupe Records",        d)
+        m3.metric("❌ Bad Records",          b)
+        m4.metric("☁️ SF Dupe Records",     s_d)
+
+        st.divider()
+
+        # ── CSV Download ──
+        st.subheader("💾 Download as CSV")
+        ecol1, ecol2, ecol3, ecol4 = st.columns(4)
+
+        ecol1.download_button(
+            label="⬇ Clean CSV",
+            data=csv_bytes(df),
+            file_name=f"{jn}_clean.csv",
+            mime="text/csv",
+        )
+        if not st.session_state.dupes_df.empty:
+            ecol2.download_button(
+                label="⬇ Dupes CSV",
+                data=csv_bytes(st.session_state.dupes_df),
+                file_name=f"{jn}_dupes.csv",
+                mime="text/csv",
+            )
+        if not st.session_state.bad_df.empty:
+            ecol3.download_button(
+                label="⬇ Bad CSV",
+                data=csv_bytes(st.session_state.bad_df),
+                file_name=f"{jn}_bad.csv",
+                mime="text/csv",
+            )
+        if not st.session_state.sf_dupes_df.empty:
+            ecol4.download_button(
+                label="⬇ SF Dupes CSV",
+                data=csv_bytes(st.session_state.sf_dupes_df),
+                file_name=f"{jn}_sf_dupes.csv",
+                mime="text/csv",
+            )
+
+        st.divider()
+
+        # ── API Load ──
+        st.subheader("🌐 Load via API (Generic REST)")
+        st.markdown('<div class="info-box">Configure an API endpoint to POST the clean data frame as JSON. '
+                    'This supports Salesforce Bulk API, custom REST endpoints, and similar targets.</div>',
+                    unsafe_allow_html=True)
+
+        api_url     = st.text_input("API Endpoint URL", placeholder="https://your-instance.my.salesforce.com/services/data/v58.0/...", key="api_url")
+        api_method  = st.selectbox("HTTP Method", ["POST", "PUT", "PATCH"], key="api_method")
+        api_headers = st.text_area(
+            "Headers (JSON)",
+            value='{"Authorization": "Bearer YOUR_TOKEN", "Content-Type": "application/json"}',
+            height=80,
+            key="api_headers",
+        )
+        batch_size  = st.number_input("Batch size (records per request, 0 = all at once)", min_value=0, value=200, step=50, key="api_batch")
+        df_export   = st.selectbox("Which DataFrame to send?", ["Clean", "Dupes", "Bad", "SF Dupes"], key="api_df")
+
+        export_map = {
+            "Clean":    st.session_state.clean_df,
+            "Dupes":    st.session_state.dupes_df,
+            "Bad":      st.session_state.bad_df,
+            "SF Dupes": st.session_state.sf_dupes_df,
+        }
+
+        if st.button("🚀 Send to API"):
+            if not api_url:
+                st.error("Please enter an API URL.")
+            else:
+                try:
+                    headers = json.loads(api_headers)
+                    send_df = export_map[df_export]
+                    records = send_df.to_dict(orient="records")
+
+                    if batch_size == 0:
+                        batches = [records]
+                    else:
+                        batches = [records[i:i+batch_size] for i in range(0, len(records), batch_size)]
+
+                    success_count = 0
+                    fail_count    = 0
+                    progress = st.progress(0)
+
+                    for idx, batch in enumerate(batches):
+                        payload = {"records": batch}
+                        r = requests.request(api_method, api_url, headers=headers, json=payload, timeout=30)
+                        if r.status_code in [200, 201, 202, 204]:
+                            success_count += len(batch)
+                        else:
+                            fail_count += len(batch)
+                            st.warning(f"Batch {idx+1} failed: {r.status_code} — {r.text[:200]}")
+                        progress.progress((idx + 1) / len(batches))
+
+                    if fail_count == 0:
+                        st.success(f"✅ Successfully sent {success_count:,} record(s) in {len(batches)} batch(es).")
+                    else:
+                        st.warning(f"Partial success: {success_count:,} sent, {fail_count:,} failed.")
+
+                except json.JSONDecodeError:
+                    st.error("Headers must be valid JSON.")
+                except Exception as e:
+                    st.error(f"API error: {e}")
+
+        st.divider()
+
+        # ── Email ──
+        st.subheader("📧 Email to Stakeholder")
+        st.markdown('<div class="info-box">Sends via SMTP. Use an app password for Gmail/Outlook.</div>',
+                    unsafe_allow_html=True)
+
+        with st.expander("SMTP & Email Settings"):
+            smtp_host   = st.text_input("SMTP Host",     value="smtp.gmail.com",  key="smtp_host")
+            smtp_port   = st.number_input("SMTP Port",   value=587, step=1,       key="smtp_port")
+            smtp_user   = st.text_input("From Email",                             key="smtp_user")
+            smtp_pass   = st.text_input("App Password",  type="password",         key="smtp_pass")
+            to_email    = st.text_input("To (comma-separated)",                   key="to_email")
+            email_subj  = st.text_input("Subject", value=f"Clean Data — {jn}",   key="email_subj")
+            email_body  = st.text_area(
+                "Body",
+                value=f"Please find the attached clean data file for job: {jn}\n\n"
+                      f"Clean records: {c}\nDupes: {d}\nIncomplete: {b}\nSF Dupes: {s_d}",
+                height=120,
+                key="email_body",
+            )
+            attach_opts = st.multiselect(
+                "Attach which DataFrames?",
+                ["Clean", "Dupes", "Bad", "SF Dupes"],
+                default=["Clean"],
+                key="email_attach",
+            )
+
+            if st.button("📤 Send Email"):
+                if not smtp_user or not smtp_pass or not to_email:
+                    st.error("Please fill in SMTP credentials and recipient.")
+                else:
+                    try:
+                        msg = MIMEMultipart()
+                        msg["From"]    = smtp_user
+                        msg["To"]      = to_email
+                        msg["Subject"] = email_subj
+                        msg.attach(MIMEText(email_body, "plain"))
+
+                        for att_name in attach_opts:
+                            att_df = export_map[att_name]
+                            if att_df is not None and not (hasattr(att_df, "empty") and att_df.empty):
+                                part = MIMEBase("application", "octet-stream")
+                                part.set_payload(csv_bytes(att_df))
+                                encoders.encode_base64(part)
+                                fname = f"{jn}_{att_name.lower().replace(' ', '_')}.csv"
+                                part.add_header("Content-Disposition", f"attachment; filename={fname}")
+                                msg.attach(part)
+
+                        with smtplib.SMTP(smtp_host, int(smtp_port)) as server:
+                            server.starttls()
+                            server.login(smtp_user, smtp_pass)
+                            recipients = [e.strip() for e in to_email.split(",")]
+                            server.sendmail(smtp_user, recipients, msg.as_string())
+
+                        st.success("✅ Email sent successfully!")
+                    except Exception as e:
+                        st.error(f"Email failed: {e}")
+
+# ══════════════════════════════════════════════
+# TAB 10 — DATA FRAMES VIEWER
+# ══════════════════════════════════════════════
+with tabs[10]:
+    st.markdown('<div class="section-header">All DataFrames</div>', unsafe_allow_html=True)
+
+    frame_tabs = st.tabs(["✅ Clean", "🔁 Dupes", "❌ Bad / Incomplete", "☁️ SF Dupes", "📜 Undo History"])
+
+    with frame_tabs[0]:
+        if st.session_state.clean_df is not None:
+            st.dataframe(st.session_state.clean_df, use_container_width=True)
+            # Move rows back
+            if len(st.session_state.clean_df) > 0:
+                move_idx = st.multiselect("Select row indices to move out of Clean", options=list(st.session_state.clean_df.index), key="move_from_clean")
+                dest = st.radio("Move to", ["Dupes", "Bad", "SF Dupes"], horizontal=True, key="move_dest_clean")
+                if move_idx and st.button("Move Selected Rows", key="do_move_clean"):
+                    push_history("Manual move from clean")
+                    rows = st.session_state.clean_df.loc[move_idx].copy()
+                    st.session_state.clean_df.drop(index=move_idx, inplace=True)
+                    st.session_state.clean_df.reset_index(drop=True, inplace=True)
+                    dest_map = {"Dupes": "dupes_df", "Bad": "bad_df", "SF Dupes": "sf_dupes_df"}
+                    key = dest_map[dest]
+                    st.session_state[key] = pd.concat([st.session_state[key], rows], ignore_index=True)
+                    st.success(f"Moved {len(rows)} row(s) to {dest}.")
+                    st.rerun()
+        else:
+            st.info("No data loaded.")
+
+    def show_sideframe(df_key, label):
+        df = st.session_state[df_key]
+        if df.empty:
+            st.info(f"No {label} records.")
+            return
+        st.dataframe(df, use_container_width=True)
+        if st.button(f"↩ Move ALL {label} back to Clean", key=f"restore_{df_key}"):
+            push_history(f"Restore {label}")
+            st.session_state.clean_df = pd.concat([st.session_state.clean_df, df], ignore_index=True)
+            st.session_state[df_key] = pd.DataFrame()
+            st.success(f"Restored {len(df)} rows back to Clean.")
+            st.rerun()
+
+    with frame_tabs[1]:
+        show_sideframe("dupes_df", "Dupes")
+    with frame_tabs[2]:
+        show_sideframe("bad_df", "Bad")
+    with frame_tabs[3]:
+        show_sideframe("sf_dupes_df", "SF Dupes")
+
+    with frame_tabs[4]:
+        if not st.session_state.history:
+            st.info("No operations in history yet.")
+        else:
+            st.write("**Undo stack (most recent last):**")
+            for i, (label, _) in enumerate(st.session_state.history):
+                st.caption(f"{i+1}. {label}")
+            if st.button("↩ Undo Last Operation", key="undo_btn_hist"):
+                undo()
+                st.rerun()

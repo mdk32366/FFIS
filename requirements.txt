@@ -1,0 +1,12 @@
+# Flat File Scrubber — Python Dependencies
+# Install with: pip install -r requirements.txt
+# Requires Python 3.9 or higher
+
+streamlit>=1.32.0
+pandas>=2.0.0
+numpy>=1.26.0
+requests>=2.31.0
+
+# All other dependencies (imaplib, smtplib, email, glob, pathlib, io, os,
+# re, json, datetime) are part of the Python standard library and require
+# no separate installation.
