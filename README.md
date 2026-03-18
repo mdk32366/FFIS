@@ -7,9 +7,14 @@
 ## Table of Contents
 
 1. [Overview](#overview)
-2. [Requirements & Installation](#requirements--installation)
-3. [Secrets Configuration](#-secrets-configuration-optional-but-recommended)
-4. [Environment Variables](#️-environment-variables-optional)
+2. [Quick Start](#quick-start)
+3. [System Requirements & Installation](#system-requirements--installation)
+4. [Configuration System](#configuration-system)
+   - [Understanding the Configuration Cascade](#understanding-the-configuration-cascade)
+   - [Option 1: Environment Variables File (.env)](#option-1-environment-variables-file-env)
+   - [Option 2: System Environment Variables](#option-2-system-environment-variables)
+   - [Option 3: Secrets File (secrets.json)](#option-3-secrets-file-secretsjson)
+   - [Available Configuration Options](#available-configuration-options)
 5. [Launching the Application](#launching-the-application)
 6. [Application Layout](#application-layout)
 7. [Sidebar Controls](#sidebar-controls)
@@ -25,13 +30,13 @@
    - [Step 9 — Salesforce Duplicate Check](#step-9--salesforce-duplicate-check)
    - [Step 10 — Export](#step-10--export)
    - [Step 11 — Data Frames Viewer](#step-11--data-frames-viewer)
-8. [Intake Methods](#intake-methods)
-9. [Supported Salesforce Objects](#supported-salesforce-objects)
-10. [The Four DataFrames](#the-four-dataframes)
-11. [Undo History](#undo-history)
-12. [Email Configuration Reference](#email-configuration-reference)
-13. [API Load Reference](#api-load-reference)
-14. [Troubleshooting](#troubleshooting)
+9. [Intake Methods](#intake-methods)
+10. [Supported Salesforce Objects](#supported-salesforce-objects)
+11. [The Four DataFrames](#the-four-dataframes)
+12. [Undo History](#undo-history)
+13. [Email Configuration Reference](#email-configuration-reference)
+14. [API Load Reference](#api-load-reference)
+15. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -49,10 +54,36 @@ The Flat File Scrubber is an interactive Streamlit web application that guides a
 | 20-step undo history | Roll back any destructive operation instantly |
 | Live sidebar metrics | Row counts across all DataFrames update in real time |
 | Three export modes | CSV download, REST API POST with batching, SMTP email |
+| Fully configurable | Environment variables, config files, and defaults work together |
 
 ---
 
-## Requirements & Installation
+## Quick Start
+
+**For running locally with defaults:**
+
+```bash
+# 1. Clone the repository
+git clone https://github.com/mdk32366/FFIS.git
+cd FFIS
+
+# 2. Create and activate virtual environment
+python -m venv .venv
+source .venv/bin/activate       # macOS / Linux
+.venv\Scripts\activate          # Windows
+
+# 3. Install dependencies
+pip install -r requirements.txt
+
+# 4. Run the app
+streamlit run flat_file_scrubber.py
+```
+
+The application will open at `http://localhost:8501`.
+
+---
+
+## System Requirements & Installation
 
 ### System Requirements
 
@@ -74,7 +105,9 @@ pip install streamlit>=1.32.0 pandas>=2.0.0 numpy>=1.26.0 requests>=2.31.0
 
 All other libraries used (`imaplib`, `smtplib`, `email`, `glob`, `pathlib`, `io`, `os`, `re`, `json`, `datetime`) are part of the Python standard library.
 
-### Recommended: Virtual Environment
+### Virtual Environment Setup
+
+Recommended for development:
 
 ```bash
 python -m venv .venv
@@ -84,117 +117,280 @@ source .venv/bin/activate       # macOS / Linux
 pip install -r requirements.txt
 ```
 
-### 🔐 Secrets Configuration (Optional but Recommended)
+---
 
-To avoid entering credentials repeatedly in the UI, create a `secrets.json` file with your IMAP, API, and SMTP credentials.
+## Configuration System
 
-1. **Copy the example file:**
-   ```bash
-   cp secrets.json.example secrets.json
-   ```
+The Flat File Scrubber uses a **layered configuration system** to support local development, container deployments, and CI/CD pipelines. No hardcoded values exist in the source code—everything is configurable.
 
-2. **Edit `secrets.json` with your credentials:**
-   ```json
-   {
-     "imap": {
-       "host": "imap.gmail.com",
-       "port": 993,
-       "use_ssl": true,
-       "folder": "INBOX"
-     },
-     "api": {
-       "endpoint_url": "https://your-instance.salesforce.com/services/...",
-       "method": "POST",
-       "headers": {
-         "Authorization": "Bearer YOUR_SALESFORCE_TOKEN",
-         "Content-Type": "application/json"
-       },
-       "batch_size": 200
-     },
-     "smtp": {
-       "host": "smtp.gmail.com",
-       "port": 587,
-       "from_email": "your-email@gmail.com",
-       "app_password": "YOUR_APP_PASSWORD"
-     }
-   }
-   ```
+### Understanding the Configuration Cascade
 
-3. **Security Note:** The `secrets.json` file is in `.gitignore` and will NOT be committed to version control. Keep this file local and secure.
+Configuration is loaded in this priority order (highest priority first):
 
-### ⚙️ Environment Variables (Optional)
+```
+┌─────────────────────────────┐
+│ System Environment Variables │  ← Highest priority (CI/CD, containers)
+├─────────────────────────────┤
+│ .env File (local)           │  ← Development & testing
+├─────────────────────────────┤
+│ secrets.json (credentials)  │  ← Credentials only
+├─────────────────────────────┤
+│ Hardcoded Defaults          │  ← Fallback values
+└─────────────────────────────┘
+```
 
-You can override any application setting using environment variables or a `.env` file. This is useful for containerization, CI/CD pipelines, or configuration management.
+**Example:** If you set `UNDO_HISTORY_LIMIT=50` in `.env` and also export `UNDO_HISTORY_LIMIT=100` in your shell, the application uses `100` (system environment wins).
 
-1. **Copy the example file:**
-   ```bash
-   cp .env.example .env
-   ```
+---
 
-2. **Edit `.env` with your settings:**
-   ```bash
-   # Streamlit UI
-   STREAMLIT_PAGE_TITLE=Flat File Scrubber
-   STREAMLIT_PAGE_ICON=🧹
-   STREAMLIT_LAYOUT=wide
-   STREAMLIT_SIDEBAR_STATE=expanded
+### Option 1: Environment Variables File (.env)
 
-   # Salesforce
-   SALESFORCE_OBJECTS=Account,Contact,Lead,Opportunity,User
-   SPECIAL_CHARS_PATTERN=[\*\n\^\$\#\@\!\%\&\(\)\[\]\{\}\<\>\?\/\\|`~"\';:]
+The `.env` file is ideal for **local development and team collaboration**. It's included in `.gitignore` to prevent accidental credential leaks.
 
-   # Application Behavior
-   UNDO_HISTORY_LIMIT=20
-   API_REQUEST_TIMEOUT=30
+#### Setup
 
-   # IMAP (Email Intake)
-   IMAP_HOST=imap.gmail.com
-   IMAP_PORT=993
-   IMAP_USE_SSL=true
-   IMAP_FOLDER=INBOX
+```bash
+# Copy the example file
+cp .env.example .env
 
-   # API (Data Export)
-   API_ENDPOINT_URL=https://your-instance.salesforce.com/services/data/v58.0/...
-   API_METHOD=POST
-   API_BATCH_SIZE=200
+# Edit with your settings
+nano .env              # Linux/macOS
+notepad .env           # Windows
+```
 
-   # SMTP (Email Export)
-   SMTP_HOST=smtp.gmail.com
-   SMTP_PORT=587
-   ```
+#### Example .env File
 
-3. **Priority:** Environment variables are loaded in this order (higher priority overrides lower):
-   - Default values in `config.py`
-   - Values from `.env` file
-   - Values from system environment variables
-   - Values from `secrets.json` (for credentials only)
+```bash
+# ──────────────────────────────────────────────
+# STREAMLIT (User Interface)
+# ──────────────────────────────────────────────
+STREAMLIT_PAGE_TITLE=Flat File Scrubber
+STREAMLIT_PAGE_ICON=🧹
+STREAMLIT_LAYOUT=wide
+STREAMLIT_SIDEBAR_STATE=expanded
 
-4. **Security Note:** The `.env` file is in `.gitignore` and will NOT be committed. Sensitive values like passwords should go in `secrets.json` instead.
+# ──────────────────────────────────────────────
+# SALESFORCE CONFIGURATION
+# ──────────────────────────────────────────────
+SALESFORCE_OBJECTS=Account,Contact,Lead,Opportunity,User,Snowflake Table - DEFAULT
+SPECIAL_CHARS_PATTERN=[\*\n\^\$\#\@\!\%\&\(\)\[\]\{\}\<\>\?\/\\|`~"\';:]
+
+# ──────────────────────────────────────────────
+# APPLICATION BEHAVIOR
+# ──────────────────────────────────────────────
+UNDO_HISTORY_LIMIT=20
+API_REQUEST_TIMEOUT=30
+
+# ──────────────────────────────────────────────
+# IMAP (Email Intake)
+# ──────────────────────────────────────────────
+IMAP_HOST=imap.gmail.com
+IMAP_PORT=993
+IMAP_USE_SSL=true
+IMAP_FOLDER=INBOX
+
+# ──────────────────────────────────────────────
+# REST API (Data Export)
+# ──────────────────────────────────────────────
+API_ENDPOINT_URL=https://your-instance.salesforce.com/services/data/v58.0/...
+API_METHOD=POST
+API_BATCH_SIZE=200
+
+# ──────────────────────────────────────────────
+# SMTP (Email Export)
+# ──────────────────────────────────────────────
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+```
+
+The `.env` file is loaded automatically when the app starts (`config.py` handles this).
+
+---
+
+### Option 2: System Environment Variables
+
+Override configuration at runtime using system environment variables. This is the preferred approach for **containerized deployments, Kubernetes, and CI/CD pipelines**.
+
+#### Setting Environment Variables
+
+**Linux / macOS (Bash):**
+```bash
+export UNDO_HISTORY_LIMIT=50
+export API_REQUEST_TIMEOUT=60
+streamlit run flat_file_scrubber.py
+```
+
+**Windows (PowerShell):**
+```powershell
+$env:UNDO_HISTORY_LIMIT=50
+$env:API_REQUEST_TIMEOUT=60
+streamlit run flat_file_scrubber.py
+```
+
+**Docker Compose:**
+```yaml
+services:
+  ffis:
+    image: ffis-app:latest
+    environment:
+      UNDO_HISTORY_LIMIT: 50
+      API_REQUEST_TIMEOUT: 60
+      STREAMLIT_PAGE_TITLE: "Acme Corp Data Loader"
+```
+
+---
+
+### Option 3: Secrets File (secrets.json)
+
+The `secrets.json` file is for **sensitive credential data only**—it should never contain non-sensitive config. Use this for credentials you don't want in version control or `.env`.
+
+#### Setup
+
+```bash
+# Copy the example file
+cp secrets.json.example secrets.json
+
+# Edit with your credentials (nano, vim, or an IDE)
+nano secrets.json
+```
+
+#### Example secrets.json
+
+```json
+{
+  "imap": {
+    "host": "imap.gmail.com",
+    "port": 993,
+    "use_ssl": true,
+    "folder": "INBOX"
+  },
+  "api": {
+    "endpoint_url": "https://acme.my.salesforce.com/services/data/v58.0/composite/sobjects",
+    "method": "POST",
+    "headers": {
+      "Authorization": "Bearer 00D5g00000IZ3ZFEA5!AQcAQIHf_5lL6Q...",
+      "Content-Type": "application/json"
+    },
+    "batch_size": 200
+  },
+  "smtp": {
+    "host": "smtp.gmail.com",
+    "port": 587,
+    "from_email": "dataloader@acme.com",
+    "app_password": "abcd efgh ijkl mnop"
+  }
+}
+```
+
+#### Important Security Notes
+
+- `secrets.json` is protected by `.gitignore`
+- Store Salesforce Bearer tokens, SMTP passwords, and email credentials here
+- For corporate deployments, use AWS Secrets Manager, HashiCorp Vault, or your organization's credential store instead
+- Never commit `secrets.json` to version control
+
+---
+
+### Available Configuration Options
+
+This table documents every environment variable and its purpose:
+
+#### Streamlit UI
+
+| Variable | Type | Default | Description |
+|---|---|---|---|
+| `STREAMLIT_PAGE_TITLE` | string | `Flat File Scrubber` | Browser tab title |
+| `STREAMLIT_PAGE_ICON` | string | `🧹` | Browser favicon emoji |
+| `STREAMLIT_LAYOUT` | string | `wide` | Page layout: `wide` or `centered` |
+| `STREAMLIT_SIDEBAR_STATE` | string | `expanded` | Sidebar state on load: `expanded` or `collapsed` |
+
+#### Salesforce
+
+| Variable | Type | Default | Description |
+|---|---|---|---|
+| `SALESFORCE_OBJECTS` | CSV list | Account,Contact,Lead,... | Comma-separated list of supported objects |
+| `SPECIAL_CHARS_PATTERN` | regex | `[\*\n\^\$...` | Characters to detect & remove in Step 6 |
+
+#### Application Behavior
+
+| Variable | Type | Default | Description |
+|---|---|---|---|
+| `UNDO_HISTORY_LIMIT` | integer | `20` | Max undo stack depth |
+| `API_REQUEST_TIMEOUT` | integer | `30` | Seconds to wait for API responses |
+
+#### IMAP (Email Intake)
+
+| Variable | Type | Default | Description |
+|---|---|---|---|
+| `IMAP_HOST` | string | `imap.gmail.com` | Mail server IMAP hostname |
+| `IMAP_PORT` | integer | `993` | IMAP port (993 for SSL, 143 for STARTTLS) |
+| `IMAP_USE_SSL` | boolean | `true` | Use SSL/TLS encryption |
+| `IMAP_FOLDER` | string | `INBOX` | Mailbox folder to scan |
+
+#### REST API (Data Export)
+
+| Variable | Type | Default | Description |
+|---|---|---|---|
+| `API_ENDPOINT_URL` | URL | *(empty)* | Target API endpoint URL |
+| `API_METHOD` | string | `POST` | HTTP method: POST, PUT, or PATCH |
+| `API_BATCH_SIZE` | integer | `200` | Records per API request |
+
+#### SMTP (Email Export)
+
+| Variable | Type | Default | Description |
+|---|---|---|---|
+| `SMTP_HOST` | string | `smtp.gmail.com` | SMTP mail server hostname |
+| `SMTP_PORT` | integer | `587` | SMTP port (587 for STARTTLS, 465 for SSL) |
+
+#### Credentials (secrets.json only)
+
+These are **NOT** environment variables—use `secrets.json` only:
+
+| Key | Location | Type | Example |
+|---|---|---|---|
+| `imap.host` | secrets.json | string | `imap.gmail.com` |
+| `api.headers.Authorization` | secrets.json | string | `Bearer <token>` |
+| `smtp.from_email` | secrets.json | string | `user@gmail.com` |
+| `smtp.app_password` | secrets.json | string | `abcd efgh ijkl mnop` |
 
 ---
 
 ## Launching the Application
 
-**Prerequisites:** Ensure you have [installed dependencies](#install-dependencies) before launching.
+### Local Execution
 
-From the directory containing `flat_file_scrubber.py`:
+From the command line:
 
 ```bash
 streamlit run flat_file_scrubber.py
 ```
 
-Streamlit will open the application automatically in your default web browser at `http://localhost:8501`.
+The app will automatically open in your default browser at `http://localhost:8501`.
 
-To run on a specific port (e.g. for a shared server):
+### Running on a Custom Port
 
 ```bash
 streamlit run flat_file_scrubber.py --server.port 8502
 ```
 
-To make the app accessible on a local network:
+### Exposing to Network
+
+To make the app accessible from other machines on your network:
 
 ```bash
 streamlit run flat_file_scrubber.py --server.address 0.0.0.0
+```
+
+Then access it via `http://<your-machine-ip>:8501` from any networked computer.
+
+### Container Deployment
+
+```bash
+docker run -p 8501:8501 \
+  -e STREAMLIT_PAGE_TITLE="Acme Data Loader" \
+  -e UNDO_HISTORY_LIMIT=50 \
+  -v /path/to/secrets.json:/app/secrets.json:ro \
+  ffis-app:latest
 ```
 
 ---
@@ -236,7 +432,7 @@ Eleven tabs, each representing a stage in the cleaning workflow. Tabs are non-li
 | **Salesforce / Target Object** | Select the object type you are loading. This drives the required-field checklist in the Inspect tab. |
 | **Workflow Steps** | Visual indicator showing which step you are currently on. Updates automatically as you progress. |
 | **DataFrame Counts** | Live row counts for all four DataFrames (Clean, Dupes, Bad, SF Dupes). Updates after every operation. |
-| **↩ Undo Last Operation** | Reverts the Clean DataFrame to its state before the most recent destructive action. Up to 20 operations are stored. |
+| **↩ Undo Last Operation** | Reverts the Clean DataFrame to its state before the most recent destructive action. Up to N operations are stored (configurable via `UNDO_HISTORY_LIMIT`). |
 | **🔄 Reset Everything** | Clears all session state and DataFrames, returning the app to its initial state. **This is irreversible.** |
 
 ---
@@ -349,13 +545,7 @@ Common use cases:
 
 Scans text columns for characters that commonly cause issues in Salesforce imports or database loads.
 
-**Default pattern scanned:**
-
-```
-[ * \n ^ $ # @ ! % & ( ) [ ] { } < > ? / \ | ` ~ " ' ; : ]
-```
-
-You may enter a custom regex pattern in the input field to override this default.
+The default pattern is configurable via the `SPECIAL_CHARS_PATTERN` environment variable.
 
 **Workflow:**
 1. Select which columns to scan (all text columns are pre-selected).
@@ -429,13 +619,13 @@ One download button per DataFrame, only shown if that DataFrame contains rows:
 
 #### Option B — Load via API
 
-Posts records to a REST endpoint as JSON. Supports Salesforce Bulk API v2, Mulesoft, custom REST APIs, and similar targets.
+Posts records to a REST endpoint as JSON. Supports Salesforce Bulk API v2, Composite API, Mulesoft, custom REST APIs, and similar targets.
 
 **Required fields:**
-- **API Endpoint URL** — the full URL of the target endpoint
-- **HTTP Method** — POST, PUT, or PATCH
+- **API Endpoint URL** — the full URL of the target endpoint (can be pre-configured with `API_ENDPOINT_URL` environment variable)
+- **HTTP Method** — POST, PUT, or PATCH (default configurable with `API_METHOD`)
 - **Headers** — a valid JSON object (paste in your Authorization Bearer token here)
-- **Batch size** — number of records per request (200 is a safe default; Salesforce Bulk API supports up to 10,000 per batch)
+- **Batch size** — number of records per request (default configurable with `API_BATCH_SIZE`; 200 is a safe default; Salesforce Bulk API supports up to 10,000 per batch)
 
 Records are sent as `{"records": [...]}` in the request body. A progress bar tracks batch completion. See [API Load Reference](#api-load-reference) for Salesforce-specific configuration.
 
@@ -444,7 +634,7 @@ Records are sent as `{"records": [...]}` in the request body. A progress bar tra
 Sends selected DataFrames as CSV attachments via SMTP.
 
 **Required fields:**
-- SMTP Host and Port
+- SMTP Host and Port (defaults configurable with `SMTP_HOST` and `SMTP_PORT`)
 - From email address and App Password
 - To email address(es), comma-separated
 - Subject and body (pre-populated with job name and record counts)
@@ -537,6 +727,8 @@ The application is pre-configured with required-field awareness for the followin
 
 You can supplement or override the pre-defined required fields in the **Inspect** tab using the "Mark Required Fields from Incoming CSV" multiselect.
 
+To add custom objects or change required fields, modify the `get_required_fields()` function in `config.py` or add a custom configuration file and load it via environment variables.
+
 ---
 
 ## The Four DataFrames
@@ -559,7 +751,9 @@ All four DataFrames can be:
 
 ## Undo History
 
-Every destructive operation (drop, fill, split, move, cast, scrub) pushes a snapshot of the Clean DataFrame onto the undo stack before making the change. The stack holds up to **20 operations**.
+Every destructive operation (drop, fill, split, move, cast, scrub) pushes a snapshot of the Clean DataFrame onto the undo stack before making the change.
+
+The maximum number of stored operations is configurable via the `UNDO_HISTORY_LIMIT` environment variable (default: **20**).
 
 To undo, click **↩ Undo Last Operation** in the sidebar or in the Data Frames → History sub-tab.
 
@@ -645,6 +839,11 @@ Run `pip install -r requirements.txt` and ensure your virtual environment is act
 ### The browser does not open automatically
 Navigate manually to `http://localhost:8501` in your browser.
 
+### Configuration changes don't take effect
+1. **For .env changes:** Streamlit automatically detects `.env` file changes. If changes don't reflect, restart with `Ctrl+C` and `streamlit run flat_file_scrubber.py`.
+2. **For environment variables:** They're read once on app start. Restart streamlit for changes to apply.
+3. **For secrets.json changes:** Restart the app.
+
 ### File upload size limit exceeded
 Increase Streamlit's upload limit by creating a `.streamlit/config.toml` file in the project directory:
 ```toml
@@ -654,25 +853,77 @@ maxUploadSize = 500
 This sets the limit to 500 MB.
 
 ### IMAP connection fails
-- Confirm the host and port are correct for your provider.
+- Confirm the host and port are correct for your provider (use values from Environment Variables table or Email Configuration Reference).
 - For Gmail: ensure 2FA is enabled and you are using an App Password (not your regular password).
 - For corporate mail: confirm that IMAP access is enabled by your IT administrator.
 - If behind a firewall, confirm outbound port 993 (or 143) is open.
 
 ### API POST returns 401 Unauthorized
-Your Bearer token has expired. Salesforce tokens expire after a period defined by your org's session settings (typically 2–12 hours). Re-authenticate and paste the new token into the Headers field.
+Your Bearer token has expired. Salesforce tokens expire after a period defined by your org's session settings (typically 2–12 hours). Re-authenticate and paste the new token into the Headers field. You can also store the token in `secrets.json` under `api.headers.Authorization` to avoid re-entering it.
 
 ### API POST returns 400 Bad Request
 The payload structure does not match what the endpoint expects. Check that your column names in the Clean DataFrame match the target API's expected field names exactly (Salesforce API names are case-sensitive, e.g. `LastName` not `last_name`). Use the Rename Columns feature in the Drop & Rename tab to align names before exporting.
 
 ### Email send fails with "SMTPAuthenticationError"
-Use an App Password rather than your account password. See [Email Configuration Reference](#email-configuration-reference).
+Use an App Password rather than your account password. See [Email Configuration Reference](#email-configuration-reference). You can also store SMTP credentials in `secrets.json` under `smtp` to avoid re-entering them.
 
 ### Undo is grayed out / has no effect
-The undo stack is empty — either no operations have been performed yet, or 20+ operations have been performed and the oldest entries have been dropped. The stack is also cleared on full reset.
+The undo stack is empty — either no operations have been performed yet, or `UNDO_HISTORY_LIMIT` operations have been performed and the oldest entries have been dropped. The stack is also cleared on full reset.
 
 ### "Reset Everything" lost my work
 The Reset button clears all session state immediately with no confirmation. This is intentional for speed during repeated testing cycles. If this is a concern, download your Clean CSV before resetting.
+
+### Custom configuration not loading
+1. Ensure `.env` is in the same directory as `flat_file_scrubber.py`.
+2. Check for typos in variable names (case-sensitive).
+3. Restart streamlit: `streamlit run flat_file_scrubber.py`.
+
+---
+
+## Architecture & Extensibility
+
+### File Structure
+
+```
+FFIS/
+├── flat_file_scrubber.py      # Main Streamlit application
+├── config.py                   # Configuration system (env, defaults, secrets)
+├── requirements.txt            # Python dependencies
+├── README.md                   # This file
+├── .env.example               # Environment variables template
+├── .gitignore                 # Prevents .env, secrets.json from being committed
+├── secrets.json.example       # Credentials template
+└── secrets.json               # (local, not committed) Actual credentials
+```
+
+### Configuration Module (config.py)
+
+The `config.py` module provides:
+- Automatic `.env` file loading
+- Helper functions for type conversion (`getenv_str`, `getenv_int`, `getenv_bool`, `getenv_list`)
+- High-level getter functions for each feature area (`get_salesforce_objects()`, `get_imap_config()`, etc.)
+- Fallback defaults for all settings
+
+Adding a new configuration option:
+
+1. Add it to `.env.example` with a clear comment
+2. Add a getter function to `config.py` (e.g., `def get_my_setting(): return getenv_str("MY_SETTING", "default")`)
+3. Import and call it in `flat_file_scrubber.py`
+
+### Adding Custom Salesforce Objects
+
+Edit `config.py`, find the `get_required_fields()` function, and add your object:
+
+```python
+def get_required_fields():
+    """Get required fields for each Salesforce object."""
+    return {
+        "Account": ["Name"],
+        "Contact": ["LastName", "AccountId"],
+        "MyCustomObject__c": ["SomeField__c", "AnotherField__c"],  # ← Add here
+        # ...
+    }
+```
 
 ---
 
