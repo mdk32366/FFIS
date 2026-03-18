@@ -21,16 +21,27 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
-from config import get_imap_config, get_api_config, get_smtp_config
+from config import (
+    get_streamlit_config,
+    get_salesforce_objects,
+    get_required_fields,
+    get_special_chars_pattern,
+    get_undo_history_limit,
+    get_api_request_timeout,
+    get_imap_config,
+    get_api_config,
+    get_smtp_config,
+)
 
 # ──────────────────────────────────────────────
 # PAGE CONFIG
 # ──────────────────────────────────────────────
+streamlit_cfg = get_streamlit_config()
 st.set_page_config(
-    page_title="Flat File Scrubber",
-    page_icon="🧹",
-    layout="wide",
-    initial_sidebar_state="expanded",
+    page_title=streamlit_cfg["page_title"],
+    page_icon=streamlit_cfg["page_icon"],
+    layout=streamlit_cfg["layout"],
+    initial_sidebar_state=streamlit_cfg["initial_sidebar_state"],
 )
 
 # ──────────────────────────────────────────────
@@ -118,31 +129,11 @@ code, pre, .stCode {
 """, unsafe_allow_html=True)
 
 # ──────────────────────────────────────────────
-# SUPPORTED OBJECTS
+# SUPPORTED OBJECTS & FIELDS (from environment)
 # ──────────────────────────────────────────────
-SUPPORTED_OBJECTS = [
-    "Account",
-    "Contact",
-    "Lead",
-    "Opportunity",
-    "Account to Account Relationship",
-    "Account to Contact Relationship",
-    "User",
-    "Snowflake Table - DEFAULT",
-]
-
-REQUIRED_FIELDS = {
-    "Account":      ["Name"],
-    "Contact":      ["LastName", "AccountId"],
-    "Lead":         ["LastName", "Company"],
-    "Opportunity":  ["Name", "StageName", "CloseDate", "AccountId"],
-    "Account to Account Relationship": ["ParentId", "ChildId"],
-    "Account to Contact Relationship": ["AccountId", "ContactId"],
-    "User":         ["LastName", "Username", "Email", "ProfileId", "TimeZoneSidKey", "LocaleSidKey", "EmailEncodingKey", "LanguageLocaleKey"],
-    "Snowflake Table - DEFAULT": [],
-}
-
-COMMON_SPECIAL_CHARS = r'[\*\n\^\$\#\@\!\%\&\(\)\[\]\{\}\<\>\?\/\\|`~"\';:]'
+SUPPORTED_OBJECTS = get_salesforce_objects()
+REQUIRED_FIELDS = get_required_fields()
+COMMON_SPECIAL_CHARS = get_special_chars_pattern()
 
 # ──────────────────────────────────────────────
 # SESSION STATE INIT
@@ -181,7 +172,8 @@ def push_history(label: str):
         st.session_state.history.append(
             (label, st.session_state.clean_df.copy())
         )
-        if len(st.session_state.history) > 20:
+        max_history = get_undo_history_limit()
+        if len(st.session_state.history) > max_history:
             st.session_state.history.pop(0)
 
 def undo():
@@ -1068,7 +1060,8 @@ with tabs[9]:
 
                     for idx, batch in enumerate(batches):
                         payload = {"records": batch}
-                        r = requests.request(api_method, api_url, headers=headers, json=payload, timeout=30)
+                        timeout = get_api_request_timeout()
+                        r = requests.request(api_method, api_url, headers=headers, json=payload, timeout=timeout)
                         if r.status_code in [200, 201, 202, 204]:
                             success_count += len(batch)
                         else:

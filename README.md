@@ -9,10 +9,11 @@
 1. [Overview](#overview)
 2. [Requirements & Installation](#requirements--installation)
 3. [Secrets Configuration](#-secrets-configuration-optional-but-recommended)
-4. [Launching the Application](#launching-the-application)
-5. [Application Layout](#application-layout)
-6. [Sidebar Controls](#sidebar-controls)
-7. [Step-by-Step Workflow Guide](#step-by-step-workflow-guide)
+4. [Environment Variables](#️-environment-variables-optional)
+5. [Launching the Application](#launching-the-application)
+6. [Application Layout](#application-layout)
+7. [Sidebar Controls](#sidebar-controls)
+8. [Step-by-Step Workflow Guide](#step-by-step-workflow-guide)
    - [Step 1 — Ingest](#step-1--ingest)
    - [Step 2 — Inspect](#step-2--inspect)
    - [Step 3 — Drop & Rename Columns](#step-3--drop--rename-columns)
@@ -120,6 +121,55 @@ To avoid entering credentials repeatedly in the UI, create a `secrets.json` file
    ```
 
 3. **Security Note:** The `secrets.json` file is in `.gitignore` and will NOT be committed to version control. Keep this file local and secure.
+
+### ⚙️ Environment Variables (Optional)
+
+You can override any application setting using environment variables or a `.env` file. This is useful for containerization, CI/CD pipelines, or configuration management.
+
+1. **Copy the example file:**
+   ```bash
+   cp .env.example .env
+   ```
+
+2. **Edit `.env` with your settings:**
+   ```bash
+   # Streamlit UI
+   STREAMLIT_PAGE_TITLE=Flat File Scrubber
+   STREAMLIT_PAGE_ICON=🧹
+   STREAMLIT_LAYOUT=wide
+   STREAMLIT_SIDEBAR_STATE=expanded
+
+   # Salesforce
+   SALESFORCE_OBJECTS=Account,Contact,Lead,Opportunity,User
+   SPECIAL_CHARS_PATTERN=[\*\n\^\$\#\@\!\%\&\(\)\[\]\{\}\<\>\?\/\\|`~"\';:]
+
+   # Application Behavior
+   UNDO_HISTORY_LIMIT=20
+   API_REQUEST_TIMEOUT=30
+
+   # IMAP (Email Intake)
+   IMAP_HOST=imap.gmail.com
+   IMAP_PORT=993
+   IMAP_USE_SSL=true
+   IMAP_FOLDER=INBOX
+
+   # API (Data Export)
+   API_ENDPOINT_URL=https://your-instance.salesforce.com/services/data/v58.0/...
+   API_METHOD=POST
+   API_BATCH_SIZE=200
+
+   # SMTP (Email Export)
+   SMTP_HOST=smtp.gmail.com
+   SMTP_PORT=587
+   ```
+
+3. **Priority:** Environment variables are loaded in this order (higher priority overrides lower):
+   - Default values in `config.py`
+   - Values from `.env` file
+   - Values from system environment variables
+   - Values from `secrets.json` (for credentials only)
+
+4. **Security Note:** The `.env` file is in `.gitignore` and will NOT be committed. Sensitive values like passwords should go in `secrets.json` instead.
 
 ---
 
