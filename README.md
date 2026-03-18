@@ -8,10 +8,11 @@
 
 1. [Overview](#overview)
 2. [Requirements & Installation](#requirements--installation)
-3. [Launching the Application](#launching-the-application)
-4. [Application Layout](#application-layout)
-5. [Sidebar Controls](#sidebar-controls)
-6. [Step-by-Step Workflow Guide](#step-by-step-workflow-guide)
+3. [Secrets Configuration](#-secrets-configuration-optional-but-recommended)
+4. [Launching the Application](#launching-the-application)
+5. [Application Layout](#application-layout)
+6. [Sidebar Controls](#sidebar-controls)
+7. [Step-by-Step Workflow Guide](#step-by-step-workflow-guide)
    - [Step 1 — Ingest](#step-1--ingest)
    - [Step 2 — Inspect](#step-2--inspect)
    - [Step 3 — Drop & Rename Columns](#step-3--drop--rename-columns)
@@ -23,13 +24,13 @@
    - [Step 9 — Salesforce Duplicate Check](#step-9--salesforce-duplicate-check)
    - [Step 10 — Export](#step-10--export)
    - [Step 11 — Data Frames Viewer](#step-11--data-frames-viewer)
-7. [Intake Methods](#intake-methods)
-8. [Supported Salesforce Objects](#supported-salesforce-objects)
-9. [The Four DataFrames](#the-four-dataframes)
-10. [Undo History](#undo-history)
-11. [Email Configuration Reference](#email-configuration-reference)
-12. [API Load Reference](#api-load-reference)
-13. [Troubleshooting](#troubleshooting)
+8. [Intake Methods](#intake-methods)
+9. [Supported Salesforce Objects](#supported-salesforce-objects)
+10. [The Four DataFrames](#the-four-dataframes)
+11. [Undo History](#undo-history)
+12. [Email Configuration Reference](#email-configuration-reference)
+13. [API Load Reference](#api-load-reference)
+14. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -81,6 +82,44 @@ source .venv/bin/activate       # macOS / Linux
 
 pip install -r requirements.txt
 ```
+
+### 🔐 Secrets Configuration (Optional but Recommended)
+
+To avoid entering credentials repeatedly in the UI, create a `secrets.json` file with your IMAP, API, and SMTP credentials.
+
+1. **Copy the example file:**
+   ```bash
+   cp secrets.json.example secrets.json
+   ```
+
+2. **Edit `secrets.json` with your credentials:**
+   ```json
+   {
+     "imap": {
+       "host": "imap.gmail.com",
+       "port": 993,
+       "use_ssl": true,
+       "folder": "INBOX"
+     },
+     "api": {
+       "endpoint_url": "https://your-instance.salesforce.com/services/...",
+       "method": "POST",
+       "headers": {
+         "Authorization": "Bearer YOUR_SALESFORCE_TOKEN",
+         "Content-Type": "application/json"
+       },
+       "batch_size": 200
+     },
+     "smtp": {
+       "host": "smtp.gmail.com",
+       "port": 587,
+       "from_email": "your-email@gmail.com",
+       "app_password": "YOUR_APP_PASSWORD"
+     }
+   }
+   ```
+
+3. **Security Note:** The `secrets.json` file is in `.gitignore` and will NOT be committed to version control. Keep this file local and secure.
 
 ---
 

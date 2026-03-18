@@ -21,6 +21,7 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
+from config import get_imap_config, get_api_config, get_smtp_config
 
 # ──────────────────────────────────────────────
 # PAGE CONFIG
@@ -457,11 +458,12 @@ with tabs[0]:
         )
 
         with st.expander("🔐 IMAP Connection Settings", expanded=True):
+            imap_cfg = get_imap_config()
             ec1, ec2 = st.columns(2)
-            imap_host    = ec1.text_input("IMAP Host",     value="imap.gmail.com",     key="imap_host")
-            imap_port    = ec2.number_input("Port",        value=993, step=1,           key="imap_port")
-            imap_ssl     = ec1.checkbox("Use SSL",         value=True,                  key="imap_ssl")
-            imap_folder  = ec2.text_input("Mailbox Folder", value="INBOX",             key="imap_folder")
+            imap_host    = ec1.text_input("IMAP Host",     value=imap_cfg.get("host", "imap.gmail.com"),     key="imap_host")
+            imap_port    = ec2.number_input("Port",        value=imap_cfg.get("port", 993), step=1,           key="imap_port")
+            imap_ssl     = ec1.checkbox("Use SSL",         value=imap_cfg.get("use_ssl", True),              key="imap_ssl")
+            imap_folder  = ec2.text_input("Mailbox Folder", value=imap_cfg.get("folder", "INBOX"),           key="imap_folder")
             imap_user    = ec1.text_input("Email Address",                              key="imap_user")
             imap_pass    = ec2.text_input("Password / App Password", type="password",   key="imap_pass")
             imap_subject = st.text_input(
@@ -1026,15 +1028,17 @@ with tabs[9]:
                     'This supports Salesforce Bulk API, custom REST endpoints, and similar targets.</div>',
                     unsafe_allow_html=True)
 
-        api_url     = st.text_input("API Endpoint URL", placeholder="https://your-instance.my.salesforce.com/services/data/v58.0/...", key="api_url")
-        api_method  = st.selectbox("HTTP Method", ["POST", "PUT", "PATCH"], key="api_method")
+        api_cfg = get_api_config()
+        api_url     = st.text_input("API Endpoint URL", value=api_cfg.get("endpoint_url", ""), placeholder="https://your-instance.my.salesforce.com/services/data/v58.0/...", key="api_url")
+        api_method  = st.selectbox("HTTP Method", ["POST", "PUT", "PATCH"], index=["POST", "PUT", "PATCH"].index(api_cfg.get("method", "POST")), key="api_method")
+        default_headers = api_cfg.get("headers", {"Authorization": "Bearer YOUR_TOKEN", "Content-Type": "application/json"})
         api_headers = st.text_area(
             "Headers (JSON)",
-            value='{"Authorization": "Bearer YOUR_TOKEN", "Content-Type": "application/json"}',
+            value=json.dumps(default_headers, indent=2),
             height=80,
             key="api_headers",
         )
-        batch_size  = st.number_input("Batch size (records per request, 0 = all at once)", min_value=0, value=200, step=50, key="api_batch")
+        batch_size  = st.number_input("Batch size (records per request, 0 = all at once)", min_value=0, value=api_cfg.get("batch_size", 200), step=50, key="api_batch")
         df_export   = st.selectbox("Which DataFrame to send?", ["Clean", "Dupes", "Bad", "SF Dupes"], key="api_df")
 
         export_map = {
@@ -1090,10 +1094,11 @@ with tabs[9]:
                     unsafe_allow_html=True)
 
         with st.expander("SMTP & Email Settings"):
-            smtp_host   = st.text_input("SMTP Host",     value="smtp.gmail.com",  key="smtp_host")
-            smtp_port   = st.number_input("SMTP Port",   value=587, step=1,       key="smtp_port")
-            smtp_user   = st.text_input("From Email",                             key="smtp_user")
-            smtp_pass   = st.text_input("App Password",  type="password",         key="smtp_pass")
+            smtp_cfg = get_smtp_config()
+            smtp_host   = st.text_input("SMTP Host",     value=smtp_cfg.get("host", "smtp.gmail.com"),          key="smtp_host")
+            smtp_port   = st.number_input("SMTP Port",   value=smtp_cfg.get("port", 587), step=1,               key="smtp_port")
+            smtp_user   = st.text_input("From Email",    value=smtp_cfg.get("from_email", ""),                  key="smtp_user")
+            smtp_pass   = st.text_input("App Password",  value=smtp_cfg.get("app_password", ""), type="password", key="smtp_pass")
             to_email    = st.text_input("To (comma-separated)",                   key="to_email")
             email_subj  = st.text_input("Subject", value=f"Clean Data — {jn}",   key="email_subj")
             email_body  = st.text_area(
