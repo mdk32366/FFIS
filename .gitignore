@@ -4,10 +4,20 @@ venv/
 env/
 ENV/
 .env
+.env.local
+.env.*.local
+.env.production.local
 
 # Secrets and Configuration
 secrets.json
+secrets.*.json
+!secrets.json.example
+!.env.example
+!.dockerenv.example
 .streamlit/secrets.toml
+credentials/
+.credentials/
+creds/
 
 # IDE
 .vscode/
@@ -48,5 +58,9 @@ Thumbs.db
 
 # Pandas/Data
 *.csv
+
+# Logs
+*.log
+logs/
 *.xlsx
 !requirements.txt

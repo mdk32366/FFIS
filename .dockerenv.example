@@ -1,0 +1,35 @@
+# Flat File Scrubber - Docker Environment Variables
+# Copy this file to .env and fill in your actual values
+
+# Streamlit Configuration
+STREAMLIT_SERVER_PORT=8501
+STREAMLIT_SERVER_ADDRESS=0.0.0.0
+STREAMLIT_SERVER_HEADLESS=true
+STREAMLIT_LOGGER_LEVEL=info
+
+# Salesforce Configuration (if applicable)
+# SF_API_KEY=your_salesforce_api_key
+# SF_API_URL=https://your-instance.salesforce.com
+
+# Snowflake Configuration (if applicable)
+# SNOWFLAKE_ACCOUNT=your_snowflake_account
+# SNOWFLAKE_USER=your_snowflake_user
+# SNOWFLAKE_PASSWORD=your_snowflake_password
+# SNOWFLAKE_DATABASE=your_database
+# SNOWFLAKE_SCHEMA=your_schema
+# SNOWFLAKE_WAREHOUSE=your_warehouse
+
+# Email Configuration (if using IMAP intake or SMTP export)
+# SMTP_SERVER=smtp.gmail.com
+# SMTP_PORT=587
+# SMTP_FROM_EMAIL=your_email@example.com
+# SMTP_PASSWORD=your_app_password
+# IMAP_SERVER=imap.gmail.com
+# IMAP_PORT=993
+# IMAP_USER=your_email@example.com
+# IMAP_PASSWORD=your_app_password
+
+# API Export Configuration (if applicable)
+# API_BASE_URL=https://your-api-endpoint.com
+# API_TIMEOUT=30
+# API_BATCH_SIZE=100

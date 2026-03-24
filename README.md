@@ -75,11 +75,36 @@ source .venv/bin/activate       # macOS / Linux
 # 3. Install dependencies
 pip install -r requirements.txt
 
-# 4. Run the app
-streamlit run flat_file_scrubber.py
+# 4. Run the app (any of these work)
+run.bat                                    # Windows (simplest!)
+./run.sh                                   # macOS / Linux
+python -m streamlit run flat_file_scrubber.py  # Universal
 ```
 
 The application will open at `http://localhost:8501`.
+
+---
+
+## 🔐 Security: Protecting Your Secrets
+
+This project includes built-in protection to prevent API keys, passwords, and database credentials from being accidentally committed to git.
+
+**Quick setup:**
+```bash
+# Interactive wizard for creating .env and secrets.json
+python setup_secrets.py
+
+# Then start the app
+streamlit run flat_file_scrubber.py
+```
+
+**What gets protected:**
+- ✅ `.env` file (application settings) — git-ignored
+- ✅ `secrets.json` file (credentials) — git-ignored
+- ✅ Environment variables (Snowflake, Salesforce, email, API keys) — never hardcoded
+- ✅ `.env.example` template — safe to commit (no secrets)
+
+**For detailed security documentation**, see [SECURITY.md](SECURITY.md).
 
 ---
 
