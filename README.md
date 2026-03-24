@@ -8,17 +8,24 @@
 
 1. [Overview](#overview)
 2. [Quick Start](#quick-start)
-3. [System Requirements & Installation](#system-requirements--installation)
-4. [Configuration System](#configuration-system)
+3. [Setup Instructions](#setup-instructions)
+   - [Security: Protecting Your Secrets](#-security-protecting-your-secrets)
+   - [System Requirements & Installation](#system-requirements--installation)
+4. [Agentic Capabilities](#-agentic-capabilities)
+   - [VS Code Agent Interface](#vs-code-agent-interface)
+   - [Python API](#python-api)
+   - [REST API](#rest-api)
+5. [Configuration System](#configuration-system)
    - [Understanding the Configuration Cascade](#understanding-the-configuration-cascade)
    - [Option 1: Environment Variables File (.env)](#option-1-environment-variables-file-env)
    - [Option 2: System Environment Variables](#option-2-system-environment-variables)
    - [Option 3: Secrets File (secrets.json)](#option-3-secrets-file-secretsjson)
    - [Available Configuration Options](#available-configuration-options)
-5. [Launching the Application](#launching-the-application)
-6. [Application Layout](#application-layout)
-7. [Sidebar Controls](#sidebar-controls)
-8. [Step-by-Step Workflow Guide](#step-by-step-workflow-guide)
+6. [Launching the Application](#launching-the-application)
+7. [Application Layout](#application-layout)
+8. [Sidebar Controls](#sidebar-controls)
+9. [Step-by-Step Workflow Guide](#step-by-step-workflow-guide)
+9. [Step-by-Step Workflow Guide](#step-by-step-workflow-guide)
    - [Step 1 — Ingest](#step-1--ingest)
    - [Step 2 — Inspect](#step-2--inspect)
    - [Step 3 — Drop & Rename Columns](#step-3--drop--rename-columns)
@@ -30,13 +37,14 @@
    - [Step 9 — Salesforce Duplicate Check](#step-9--salesforce-duplicate-check)
    - [Step 10 — Export](#step-10--export)
    - [Step 11 — Data Frames Viewer](#step-11--data-frames-viewer)
-9. [Intake Methods](#intake-methods)
-10. [Supported Salesforce Objects](#supported-salesforce-objects)
-11. [The Four DataFrames](#the-four-dataframes)
-12. [Undo History](#undo-history)
-13. [Email Configuration Reference](#email-configuration-reference)
-14. [API Load Reference](#api-load-reference)
-15. [Troubleshooting](#troubleshooting)
+10. [Intake Methods](#intake-methods)
+11. [Supported Salesforce Objects](#supported-salesforce-objects)
+12. [The Four DataFrames](#the-four-dataframes)
+13. [Undo History](#undo-history)
+14. [Email Configuration Reference](#email-configuration-reference)
+15. [API Load Reference](#api-load-reference)
+16. [Docker Deployment](#docker-deployment)
+17. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -85,30 +93,190 @@ The application will open at `http://localhost:8501`.
 
 ---
 
-## 🔐 Security: Protecting Your Secrets
+## Setup Instructions
+
+### Initial Setup (First Time)
+
+Before launching the application, you need to configure your environment with API keys, database credentials, and other settings.
+
+**Step 1: Configure Secrets**
+
+```bash
+# Run the interactive setup wizard (Windows, macOS, or Linux)
+python setup_secrets.py
+```
+
+This will guide you through:
+- 🔧 Creating `.env` file (application settings)
+- 🔐 Creating `secrets.json` file (sensitive credentials)
+- ✅ Verifying `.gitignore` protection
+
+You can also configure manually:
+```bash
+# Copy template files
+cp .env.example .env
+cp secrets.json.example secrets.json
+
+# Edit with your credentials
+nano .env              # or use VS Code
+nano secrets.json      # or use VS Code
+```
+
+**What credentials you might need:**
+- **Salesforce:** API key, API URL
+- **Snowflake:** Account ID, username, password, warehouse, database
+- **Email (optional):** SMTP server, password, IMAP server
+- **REST API (optional):** Endpoint URL, authentication token
+
+**Step 2: Install Dependencies**
+
+```bash
+pip install -r requirements.txt
+```
+
+**Step 3: Verify Configuration**
+
+```bash
+# Test that secrets are protected from git
+git status
+# .env and secrets.json should NOT appear in the list
+
+# Verify imports work
+python -c "from config import get_snowflake_config; print('✓ Config loaded')"
+```
+
+### 🔐 Security: Protecting Your Secrets
 
 This project includes built-in protection to prevent API keys, passwords, and database credentials from being accidentally committed to git.
-
-**Quick setup:**
-```bash
-# Interactive wizard for creating .env and secrets.json
-python setup_secrets.py
-
-# Then start the app
-streamlit run flat_file_scrubber.py
-```
 
 **What gets protected:**
 - ✅ `.env` file (application settings) — git-ignored
 - ✅ `secrets.json` file (credentials) — git-ignored
-- ✅ Environment variables (Snowflake, Salesforce, email, API keys) — never hardcoded
+- ✅ Environment variables (Snowflake, Salesforce, etc.) — never hardcoded
 - ✅ `.env.example` template — safe to commit (no secrets)
 
-**For detailed security documentation**, see [SECURITY.md](SECURITY.md).
+**For detailed security documentation**, see [SECURITY.md](SECURITY.md) and [SECRETS_SETUP.md](SECRETS_SETUP.md).
 
 ---
 
-## System Requirements & Installation
+## 🤖 Agentic Capabilities
+
+The Flat File Scrubber now includes intelligent agent capabilities that provide three ways to interact with the application:
+
+### VS Code Agent Interface
+
+Use the **FFIS Agent** directly in VS Code for hands-free automation and expert guidance:
+
+```
+1. Open VS Code and this workspace
+2. Open the VS Code Chat interface (@github.com/copilot)
+3. Ask: "Use the FFIS Agent to validate my CSV file"
+```
+
+**Agent can help with:**
+- 📖 Guided walkthroughs of the 11-step cleaning workflow
+- 🔧 Automation of batch cleaning and export operations
+- 🚀 Deployment and infrastructure questions
+- 🐛 Troubleshooting data issues
+- 📊 Reporting and analysis
+
+**Example requests:**
+```
+@FFISAgent help me clean employee_data.csv and export to Snowflake
+@FFISAgent what validation rules apply to the Contact object?
+@FFISAgent automate the daily Salesforce sync
+@FFISAgent troubleshoot duplicate detection issues
+```
+
+See [AGENTIFICATION.md](AGENTIFICATION.md) for detailed agent documentation.
+
+### Python API
+
+Programmatically interact with FFIS in Python scripts and notebooks:
+
+```python
+from ffis_agent import FFISAgent
+
+# Initialize
+agent = FFISAgent(config_file=".env")
+
+# Validate a CSV file
+validation = agent.validate_csv("data/contacts.csv", object_type="Contact")
+print(validation.report)
+
+# Clean data
+result = agent.clean_csv(
+    "data/contacts.csv",
+    operations=["detect_duplicates", "fix_special_chars", "standardize_nulls"]
+)
+print(f"Cleaned {result.clean_count} records")
+
+# Export to Snowflake
+agent.export_to_snowflake(result.clean_df, table_name="contacts_cleaned")
+
+# Export to REST API
+agent.export_to_api(result.clean_df, endpoint="https://api.example.com/contacts")
+```
+
+Full API documentation in [ffis_agent.py](ffis_agent.py).
+
+### REST API
+
+Expose FFIS capabilities over HTTP for integration with other systems:
+
+**Start the REST server:**
+```bash
+pip install fastapi uvicorn[standard]
+python ffis_api.py
+```
+
+**Server runs at:** `http://localhost:8000`
+
+**Interactive documentation:** `http://localhost:8000/docs`
+
+**Example requests:**
+
+```bash
+# Validate CSV
+curl -X POST "http://localhost:8000/validate" \
+  -H "Content-Type: application/json" \
+  -d '{"file_path": "data/contacts.csv", "object_type": "Contact"}'
+
+# Clean CSV
+curl -X POST "http://localhost:8000/clean" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "file_path": "data/contacts.csv",
+    "operations": ["detect_duplicates", "fix_special_chars"]
+  }'
+
+# Export to Snowflake
+curl -X POST "http://localhost:8000/export/snowflake" \
+  -H "Content-Type: application/json" \
+  -d '{"file_path": "output/cleaned.csv", "table_name": "contacts"}'
+
+# Export to REST API
+curl -X POST "http://localhost:8000/export/api" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "file_path": "output/cleaned.csv",
+    "endpoint": "https://api.example.com/contacts"
+  }'
+```
+
+**Available endpoints:**
+- `POST /validate` — Validate CSV file
+- `POST /clean` — Apply cleaning operations
+- `POST /export/snowflake` — Load to Snowflake
+- `POST /export/api` — Export to REST API
+- `GET /health` — Server status
+- `GET /docs` — Interactive Swagger documentation
+
+See [ffis_api.py](ffis_api.py) for full REST API documentation.
+
+---
+
+### System Requirements & Installation
 
 ### System Requirements
 
@@ -853,6 +1021,38 @@ Batch:   10000
 ```
 
 > **Note:** Obtaining a Salesforce Bearer token requires a separate OAuth flow (username-password flow, JWT Bearer flow, or Connected App). The Flat File Scrubber does not perform OAuth — paste your token directly into the Headers field.
+
+---
+
+## Docker Deployment
+
+The Flat File Scrubber is fully containerized for deployment to development, staging, and production environments.
+
+### Quick Docker Start
+
+**Windows:**
+```bash
+build.bat
+docker-compose up -d
+```
+
+**macOS/Linux:**
+```bash
+./build.sh
+docker-compose up -d
+```
+
+Application runs at `http://localhost:8501`
+
+### Deployment Options
+
+For comprehensive deployment instructions to:
+- 🌥️ **Google Cloud Run**
+- ☁️ **AWS ECS**
+- 🐘 **Kubernetes**
+- 🐳 **Docker Swarm**
+
+See the complete [DEPLOYMENT.md](DEPLOYMENT.md) guide.
 
 ---
 
