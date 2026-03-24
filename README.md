@@ -163,6 +163,19 @@ This project includes built-in protection to prevent API keys, passwords, and da
 
 The Flat File Scrubber now includes intelligent agent capabilities that provide three ways to interact with the application:
 
+### ⚠️ Important: Agent is Separate from Streamlit UI
+
+The **Streamlit UI** (`http://localhost:8501`) is the traditional **tab-based data cleaning interface** (Ingest → Inspect → Transform → Export). It does **NOT** include a chat window.
+
+The **FFIS Agent** is a separate intelligent assistant with three access points:
+1. **VS Code Chat** (`@FFISAgent`) — Best for interactive help
+2. **Python API** (`from ffis_agent import FFISAgent`) — Best for scripts
+3. **REST API** (`http://localhost:8000`) — Best for microservices
+
+These are **complementary tools**. Use the Streamlit UI for manual cleaning, or use the Agent for automation and programmatic access.
+
+---
+
 ### VS Code Agent Interface
 
 Use the **FFIS Agent** directly in VS Code for hands-free automation and expert guidance:
