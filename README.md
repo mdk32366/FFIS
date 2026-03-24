@@ -471,10 +471,10 @@ nano secrets.json
     "folder": "INBOX"
   },
   "api": {
-    "endpoint_url": "https://acme.my.salesforce.com/services/data/v58.0/composite/sobjects",
+    "endpoint_url": "https://your-instance.my.salesforce.com/services/data/v58.0/composite/sobjects",
     "method": "POST",
     "headers": {
-      "Authorization": "Bearer 00D5g00000IZ3ZFEA5!AQcAQIHf_5lL6Q...",
+      "Authorization": "Bearer YOUR_SALESFORCE_BEARER_TOKEN",
       "Content-Type": "application/json"
     },
     "batch_size": 200
@@ -482,8 +482,8 @@ nano secrets.json
   "smtp": {
     "host": "smtp.gmail.com",
     "port": 587,
-    "from_email": "dataloader@acme.com",
-    "app_password": "abcd efgh ijkl mnop"
+    "from_email": "your_email@gmail.com",
+    "app_password": "YOUR_APP_PASSWORD_HERE"
   }
 }
 ```
