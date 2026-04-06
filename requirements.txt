@@ -10,3 +10,4 @@ requests>=2.31.0
 # All other dependencies (imaplib, smtplib, email, glob, pathlib, io, os,
 # re, json, datetime) are part of the Python standard library and require
 # no separate installation.
+anthropic>=0.40.0

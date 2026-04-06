@@ -32,8 +32,6 @@ from config import (
     get_api_config,
     get_smtp_config,
 )
-from ffis_chat import render_chat_tab
-
 
 # ──────────────────────────────────────────────
 # PAGE CONFIG
@@ -263,7 +261,6 @@ tabs = st.tabs([
     "☁️ SF Dupe Check",
     "📤 Export",
     "📋 Data Frames",
-    "🤖 AI Assistant",
 ])
 
 # ──────────────────────────────────────────────
@@ -1200,10 +1197,3 @@ with tabs[10]:
             if st.button("↩ Undo Last Operation", key="undo_btn_hist"):
                 undo()
                 st.rerun()
-
-# ══════════════════════════════════════════════
-# TAB 11 — AI ASSISTANT (Chat)
-# ══════════════════════════════════════════════
-
-with tabs[11]:
-    render_chat_tab()
