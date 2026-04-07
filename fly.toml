@@ -1,0 +1,40 @@
+# fly.toml — FFIS Flat File Scrubber
+# Deploy with: fly deploy
+# Docs: https://fly.io/docs/reference/configuration/
+
+app            = "ffis-scrubber"   # Change if name is taken — must be globally unique
+primary_region = "sea"             # Seattle — closest to the PNW
+
+[build]
+  # Uses the Dockerfile in the repo root
+
+[env]
+  STREAMLIT_PAGE_TITLE    = "Flat File Scrubber"
+  STREAMLIT_PAGE_ICON     = "🧹"
+  STREAMLIT_LAYOUT        = "wide"
+  STREAMLIT_SIDEBAR_STATE = "expanded"
+  UNDO_HISTORY_LIMIT      = "20"
+  API_REQUEST_TIMEOUT     = "30"
+
+[http_service]
+  internal_port        = 8501
+  force_https          = true
+  auto_stop_machines   = false   # always-on — no cold starts for a data tool
+  auto_start_machines  = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type       = "connections"
+    hard_limit = 25
+    soft_limit = 20
+
+[[http_service.checks]]
+  grace_period = "30s"
+  interval     = "15s"
+  method       = "GET"
+  timeout      = "5s"
+  path         = "/_stcore/health"
+
+[[vm]]
+  memory = "2gb"
+  cpus   = 1
