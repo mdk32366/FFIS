@@ -2,8 +2,8 @@
 # Deploy with: fly deploy
 # Docs: https://fly.io/docs/reference/configuration/
 
-app            = "ffis-scrubber"   # Change if name is taken — must be globally unique
-primary_region = "sea"             # Seattle — closest to the PNW
+app            = "ffis-server"   # Change if name is taken — must be globally unique
+primary_region = "sjc"             # San Jose — Seattle region deprecated
 
 [build]
   # Uses the Dockerfile in the repo root
