@@ -6,6 +6,7 @@ streamlit>=1.32.0
 pandas>=2.0.0
 numpy>=1.26.0
 requests>=2.31.0
+weasyprint>=60.0  # For PDF export of diagnostic reports
 
 # All other dependencies (imaplib, smtplib, email, glob, pathlib, io, os,
 # re, json, datetime) are part of the Python standard library and require

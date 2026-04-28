@@ -32,19 +32,6 @@ from config import (
     get_api_config,
     get_smtp_config,
 )
-
-# >>> ffis-addons:imports >>>
-# Lazy-imported inside their tab bodies to avoid blowing up app start if
-# either module has an import-time error in this environment.
-def _ffis_addons_render_org_panel():
-    from ffis_sf_org import render_org_panel
-    return render_org_panel()
-
-def _ffis_addons_render_diag_panel():
-    from ffis_diagnostics import render_diagnostic_panel
-    return render_diagnostic_panel()
-# <<< ffis-addons:imports <<<
-
 from ffis_chat import render_chat_tab
 
 
@@ -261,140 +248,6 @@ with st.sidebar:
             del st.session_state[k]
         st.rerun()
 
-    # Quick create Salesforce org button
-    st.divider()
-    st.markdown("**Salesforce Org Management**")
-    if st.button("🚀 Quick Create Dev Org", use_container_width=True, type="primary"):
-        st.session_state["_show_quick_org_modal"] = True
-
-    # Quick Create Org Modal/Dialog
-    if st.session_state.get("_show_quick_org_modal"):
-        st.markdown('<div class="section-header">⚡ Quick Create Salesforce Org</div>', unsafe_allow_html=True)
-        
-        modal_org_type = st.radio(
-            "Choose org type:",
-            ["🏗️ Development Org (Free, Permanent)", "🧪 Scratch Org (Temporary)"],
-            key="modal_org_type"
-        )
-        
-        # ─ Development Org Option ─────────────────────────────────────────────
-        if "Development" in modal_org_type:
-            st.caption("Free, permanent Salesforce org. No Dev Hub needed.")
-            modal_dev_alias = st.text_input(
-                "Org Alias",
-                value="",
-                placeholder="e.g. dev-org-1",
-                key="modal_dev_alias",
-                help="Name for your new Development org"
-            )
-            
-            dev_col1, dev_col2 = st.columns(2)
-            if dev_col1.button("📝 Sign Up Free", key="modal_dev_signup", help="Opens developer.salesforce.com/signup"):
-                import webbrowser
-                webbrowser.open("https://developer.salesforce.com/signup")
-                st.info("✓ Signup page opened in browser. Complete the form, then come back to authorize.")
-            
-            if dev_col2.button("✅ Authorize", key="modal_dev_auth", type="primary"):
-                if not modal_dev_alias:
-                    st.error("Enter an org alias first.")
-                else:
-                    try:
-                        from ffis_sf_org import login_web, _ss_record_call, list_orgs, _ss_replace_orgs
-                        with st.spinner(f"Opening browser for login to **{modal_dev_alias}**…"):
-                            res = login_web("https://login.salesforce.com", modal_dev_alias, set_default=True)
-                        _ss_record_call(res)
-                        if res.ok:
-                            st.success(f"✅ **{modal_dev_alias}** authorized!")
-                            st.balloons()
-                            # Refresh orgs list
-                            orgs, lr = list_orgs()
-                            _ss_record_call(lr)
-                            _ss_replace_orgs(orgs)
-                            st.session_state["_show_quick_org_modal"] = False
-                        else:
-                            st.error(f"Auth failed: {res.parsed.get('message') if res.parsed else 'unknown error'}")
-                    except Exception as e:
-                        st.error(f"Error: {e}")
-        
-        # ─ Scratch Org Option ─────────────────────────────────────────────────
-        else:
-            st.caption("Temporary org (up to 30 days). Requires a Dev Hub.")
-            quick_modal_alias = st.text_input(
-                "Org Alias",
-                value="",
-                placeholder="e.g. scratch-1",
-                key="modal_quick_alias",
-                help="Name for your new scratch org"
-            )
-            
-            # Get available dev hubs
-            try:
-                from ffis_sf_org import list_orgs, _ss_record_call, _ss_replace_orgs, _envelope_payload, create_scratch_org, DEFAULT_SCRATCH_DEF, SCRATCH_DURATION_DEFAULT, find_sf_cli
-                if st.button("🔄 Check Dev Hubs", key="modal_check_devhubs"):
-                    orgs, res = list_orgs()
-                    _ss_record_call(res)
-                    _ss_replace_orgs(orgs)
-                
-                orgs = st.session_state.get("sf_authorized_orgs") or []
-                dev_hub_options = [o for o in orgs if o.is_dev_hub]
-                
-                if dev_hub_options:
-                    st.success(f"✅ {len(dev_hub_options)} Dev Hub(s) found")
-                else:
-                    st.warning("⚠️ No Dev Hub — authorize one first in SF Org tab")
-                    st.caption("Use: SF Org tab → Authorize Org (Web Login)")
-                
-                if st.button("🚀 Create Org", key="modal_create_btn", type="primary", use_container_width=True):
-                    errs = []
-                    if not quick_modal_alias:
-                        errs.append("Enter an org alias.")
-                    elif not dev_hub_options:
-                        errs.append("No Dev Hub available.")
-                    else:
-                        import os
-                        from pathlib import Path
-                        quick_project_dir = os.getcwd()
-                        if not Path(quick_project_dir).is_dir():
-                            errs.append(f"Project directory not found: {quick_project_dir}")
-                        elif not (Path(quick_project_dir) / "sfdx-project.json").is_file():
-                            errs.append(f"Directory missing sfdx-project.json")
-                        elif not (Path(quick_project_dir) / DEFAULT_SCRATCH_DEF).is_file():
-                            errs.append(f"Definition file not found: {DEFAULT_SCRATCH_DEF}")
-                    
-                    if errs:
-                        for e in errs:
-                            st.error(e)
-                    else:
-                        with st.spinner(f"🚀 Creating **{quick_modal_alias}** (1–5 min)…"):
-                            res = create_scratch_org(
-                                project_dir=os.getcwd(),
-                                definition_file=DEFAULT_SCRATCH_DEF,
-                                alias=quick_modal_alias,
-                                dev_hub_alias=dev_hub_options[0].alias or dev_hub_options[0].username,
-                                duration_days=SCRATCH_DURATION_DEFAULT,
-                                set_default=True,
-                            )
-                        _ss_record_call(res)
-                        if res.ok:
-                            payload = _envelope_payload(res.parsed) or {}
-                            org_id = payload.get("orgId") or payload.get("id") or "?"
-                            st.success(f"✅ Created **{quick_modal_alias}** (ID: {org_id})")
-                            st.balloons()
-                            st.session_state["_show_quick_org_modal"] = False
-                            refreshed, lr = list_orgs()
-                            _ss_record_call(lr)
-                            _ss_replace_orgs(refreshed)
-                        else:
-                            msg = res.parsed.get("message") if res.parsed else ""
-                            st.error(f"Failed: {msg or 'unknown error'}")
-            except Exception as e:
-                st.error(f"Error: {e}")
-                st.caption("Make sure the SF Org tab is accessible")
-        
-        if st.button("✕ Close", key="modal_close_btn"):
-            st.session_state["_show_quick_org_modal"] = False
-            st.rerun()
-
 # ──────────────────────────────────────────────
 # MAIN AREA — TABS
 # ──────────────────────────────────────────────
@@ -411,12 +264,6 @@ tabs = st.tabs([
     "📤 Export",
     "📋 Data Frames",
     "🤖 AI Assistant",
-
-# >>> ffis-addons:tab-labels >>>
-"🧪 SF Org",
-"📊 Diagnostic Report",
-# <<< ffis-addons:tab-labels <<<
-
 ])
 
 # ──────────────────────────────────────────────
@@ -424,14 +271,6 @@ tabs = st.tabs([
 # ──────────────────────────────────────────────
 def load_dataframe(file_like, filename: str, has_header: bool):
     """Read a CSV-like source into clean_df and raw_df."""
-
-    # >>> ffis-addons:capture-source-filename >>>
-    try:
-        st.session_state["source_filename"] = filename
-        st.session_state["ingest_filename"] = filename
-    except Exception:
-        pass
-    # <<< ffis-addons:capture-source-filename <<<
     if has_header:
         df = pd.read_csv(file_like)
     else:
@@ -1368,18 +1207,3 @@ with tabs[10]:
 
 with tabs[11]:
     render_chat_tab()
-
-
-# >>> ffis-addons:tab-bodies >>>
-# ══════════════════════════════════════════════
-# TAB N+0 — SALESFORCE ORG MANAGEMENT (added by ffis-addons)
-# ══════════════════════════════════════════════
-with tabs[-2]:
-    _ffis_addons_render_org_panel()
-
-# ══════════════════════════════════════════════
-# TAB N+1 — JOB SUMMARY & DIAGNOSTIC REPORT (added by ffis-addons)
-# ══════════════════════════════════════════════
-with tabs[-1]:
-    _ffis_addons_render_diag_panel()
-# <<< ffis-addons:tab-bodies <<<
