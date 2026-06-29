@@ -6,10 +6,21 @@ streamlit>=1.32.0
 pandas>=2.0.0
 numpy>=1.26.0
 requests>=2.31.0
-weasyprint>=60.0  # For PDF export of diagnostic reports
+
+# PDF export of diagnostic reports.
+# Requires system libs — see Dockerfile for apt-get installs.
+weasyprint>=60.0
 
 # All other dependencies (imaplib, smtplib, email, glob, pathlib, io, os,
 # re, json, datetime) are part of the Python standard library and require
 # no separate installation.
 anthropic>=0.40.0
 tabulate>=0.9.0
+
+# Snowflake integration (snowflake_connector.py)
+snowflake-connector-python>=3.6.0
+
+# App-level username/password authentication
+streamlit-authenticator>=0.3.3
+bcrypt>=4.0.0
+PyYAML>=6.0

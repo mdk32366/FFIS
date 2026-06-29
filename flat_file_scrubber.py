@@ -3,11 +3,13 @@ Flat File Scrubbing Workflow - Streamlit Application
 Based on SFCOE workflow by Matthew.Kelly (Jan 26, 2026)
 """
 
+import base64
+import os
+import yaml
 import streamlit as st
 import pandas as pd
 import numpy as np
 import io
-import os
 import re
 import glob
 import json
@@ -15,6 +17,7 @@ import smtplib
 import imaplib
 import email as email_lib
 import requests
+import streamlit_authenticator as stauth
 from datetime import datetime
 from pathlib import Path
 from email.mime.text import MIMEText
@@ -49,7 +52,7 @@ from ffis_chat import render_chat_tab
 
 
 # ──────────────────────────────────────────────
-# PAGE CONFIG
+# PAGE CONFIG  (must be first Streamlit call)
 # ──────────────────────────────────────────────
 streamlit_cfg = get_streamlit_config()
 st.set_page_config(
@@ -60,88 +63,85 @@ st.set_page_config(
 )
 
 # ──────────────────────────────────────────────
-# CUSTOM CSS
+# AUTHENTICATION
 # ──────────────────────────────────────────────
-st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Syne:wght@400;600;800&display=swap');
+# Credentials are stored as a base64-encoded YAML string in the environment
+# variable FFIS_AUTH_CONFIG so they never touch the filesystem on Fly.io.
+#
+# To generate the config locally:
+#   python scripts/make_auth_config.py          # see that file for usage
+#
+# To push to Fly.io:
+#   fly secrets set FFIS_AUTH_CONFIG="$(python scripts/make_auth_config.py --b64)"
+#
+# Structure of the decoded YAML:
+#   credentials:
+#     usernames:
+#       alice:
+#         name: Alice Smith
+#         password: <bcrypt-hash>
+#       bob:
+#         name: Bob Jones
+#         password: <bcrypt-hash>
+#   cookie:
+#     name: ffis_auth
+#     key: <random-32-char-string>
+#     expiry_days: 7
 
-html, body, [class*="css"] {
-    font-family: 'Syne', sans-serif;
-}
-code, pre, .stCode {
-    font-family: 'JetBrains Mono', monospace !important;
-}
+def _load_auth_config() -> dict:
+    """
+    Load authenticator config from FFIS_AUTH_CONFIG env var (base64 YAML).
+    Falls back to a local auth_config.yaml for development convenience.
+    Raises a clear RuntimeError if neither is available.
+    """
+    raw_b64 = os.environ.get("FFIS_AUTH_CONFIG", "").strip()
+    if raw_b64:
+        try:
+            decoded = base64.b64decode(raw_b64).decode("utf-8")
+            return yaml.safe_load(decoded)
+        except Exception as exc:
+            raise RuntimeError(
+                f"FFIS_AUTH_CONFIG env var is set but could not be decoded: {exc}"
+            ) from exc
 
-/* Dark industrial theme */
-.stApp {
-    background-color: #0e1117;
-    color: #e2e8f0;
-}
+    # Development fallback — never present on Fly.io
+    local_path = Path(__file__).parent / "auth_config.yaml"
+    if local_path.exists():
+        with open(local_path, "r") as fh:
+            return yaml.safe_load(fh)
 
-/* Sidebar */
-[data-testid="stSidebar"] {
-    background-color: #161b27;
-    border-right: 1px solid #2d3748;
-}
+    raise RuntimeError(
+        "No authentication configuration found.\n\n"
+        "On Fly.io:  fly secrets set FFIS_AUTH_CONFIG=\"$(python scripts/make_auth_config.py --b64)\"\n"
+        "Locally:    copy auth_config.yaml.example → auth_config.yaml and fill in credentials."
+    )
 
-/* Metric cards */
-[data-testid="stMetric"] {
-    background: #1a2035;
-    border: 1px solid #2d3748;
-    border-radius: 8px;
-    padding: 12px 16px;
-}
 
-/* Section headers */
-.section-header {
-    font-family: 'Syne', sans-serif;
-    font-weight: 800;
-    font-size: 1.1rem;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    color: #63b3ed;
-    padding: 6px 0 2px 0;
-    border-bottom: 2px solid #2b6cb0;
-    margin-bottom: 12px;
-}
+try:
+    _auth_cfg = _load_auth_config()
+except RuntimeError as _auth_err:
+    st.error(str(_auth_err))
+    st.stop()
 
-/* Status badge */
-.badge-clean   { background:#276749; color:#c6f6d5; padding:2px 10px; border-radius:12px; font-size:0.78rem; font-weight:700; }
-.badge-dupes   { background:#744210; color:#fefcbf; padding:2px 10px; border-radius:12px; font-size:0.78rem; font-weight:700; }
-.badge-bad     { background:#63171b; color:#fed7d7; padding:2px 10px; border-radius:12px; font-size:0.78rem; font-weight:700; }
-.badge-sf      { background:#2a4365; color:#bee3f8; padding:2px 10px; border-radius:12px; font-size:0.78rem; font-weight:700; }
+authenticator = stauth.Authenticate(
+    credentials=_auth_cfg["credentials"],
+    cookie_name=_auth_cfg["cookie"]["name"],
+    cookie_key=_auth_cfg["cookie"]["key"],
+    cookie_expiry_days=_auth_cfg["cookie"]["expiry_days"],
+)
 
-/* Warning / info boxes */
-.info-box {
-    background: #1e3a5f;
-    border-left: 4px solid #63b3ed;
-    padding: 10px 14px;
-    border-radius: 4px;
-    font-size: 0.88rem;
-    margin: 8px 0;
-}
-.warn-box {
-    background: #3d2408;
-    border-left: 4px solid #ed8936;
-    padding: 10px 14px;
-    border-radius: 4px;
-    font-size: 0.88rem;
-    margin: 8px 0;
-}
+authenticator.login()
 
-/* Dataframe tweaks */
-[data-testid="stDataFrame"] { border: 1px solid #2d3748; border-radius: 6px; }
+if st.session_state.get("authentication_status") is False:
+    st.error("Incorrect username or password.")
+    st.stop()
 
-/* Button row */
-.stButton > button {
-    border-radius: 6px;
-    font-family: 'Syne', sans-serif;
-    font-weight: 600;
-    letter-spacing: 0.04em;
-}
-</style>
-""", unsafe_allow_html=True)
+if st.session_state.get("authentication_status") is None:
+    st.warning("Please enter your username and password.")
+    st.stop()
+
+# ── Authenticated past this point ─────────────────────────────────────────────
+
 
 # ──────────────────────────────────────────────
 # SUPPORTED OBJECTS & FIELDS (from environment)
@@ -213,6 +213,13 @@ def csv_bytes(df: pd.DataFrame) -> bytes:
 with st.sidebar:
     st.markdown("### 🧹 Flat File Scrubber")
     st.caption("SFCOE · Data Steward Toolkit")
+    st.divider()
+
+    # ── Auth status & logout ──────────────────────────────────────────
+    _logged_in_name = st.session_state.get("name", "")
+    if _logged_in_name:
+        st.caption(f"👤 {_logged_in_name}")
+    authenticator.logout("Log out", "sidebar", key="sidebar_logout")
     st.divider()
 
     # Job name

@@ -1,9 +1,16 @@
 # fly.toml — FFIS Flat File Scrubber
 # Deploy with: fly deploy
 # Docs: https://fly.io/docs/reference/configuration/
+#
+# Required secrets (set once, never stored here):
+#   fly secrets set ANTHROPIC_API_KEY="sk-ant-..."
+#   fly secrets set FFIS_AUTH_CONFIG="$(cat auth_config.yaml | base64)"
+#
+# App name must match what was registered with: fly launch --no-deploy
+# The Cloudflare tunnel in FFIS_Flyio_Runbook.md points to ffis-scrubber.fly.dev
 
-app            = "ffis-server"   # Change if name is taken — must be globally unique
-primary_region = "sjc"             # San Jose — Seattle region deprecated
+app            = "ffis-scrubber"
+primary_region = "sjc"
 
 [build]
   # Uses the Dockerfile in the repo root

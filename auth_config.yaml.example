@@ -1,0 +1,22 @@
+# auth_config.yaml.example
+# Copy to auth_config.yaml (gitignored) and fill in real values,
+# OR generate automatically with:
+#   python scripts/make_auth_config.py
+#
+# Passwords MUST be bcrypt hashes — never store plaintext here.
+# Generate a hash:
+#   python -c "import bcrypt; print(bcrypt.hashpw(b'yourpassword', bcrypt.gensalt()).decode())"
+
+credentials:
+  usernames:
+    alice:
+      name: Alice Smith
+      password: "$2b$12$REPLACE_WITH_REAL_BCRYPT_HASH_FOR_ALICE"
+    bob:
+      name: Bob Jones
+      password: "$2b$12$REPLACE_WITH_REAL_BCRYPT_HASH_FOR_BOB"
+
+cookie:
+  name: ffis_auth
+  key: "REPLACE_WITH_RANDOM_48_CHAR_HEX_STRING"   # secrets.token_hex(24)
+  expiry_days: 7
