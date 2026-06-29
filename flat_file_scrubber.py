@@ -223,13 +223,13 @@ with st.sidebar:
     st.divider()
 
     # Job name
- short_desc = st.text_input("Job Short Description (e.g. 'Apollo Load')", value="")
-if short_desc:
-    jn = f"{short_desc.replace(' ', '_')}_{today_str()}"
-else:
-    jn = f"FFIS_job_{today_str()}"
-st.session_state.job_name = jn
-st.code(jn, language=None)
+    short_desc = st.text_input("Job Short Description (e.g. 'Apollo Load')", value="")
+        if short_desc:
+        jn = f"{short_desc.replace(' ', '_')}_{today_str()}"
+    else:
+        jn = f"FFIS_job_{today_str()}"
+        st.session_state.job_name = jn
+        st.code(jn, language=None)
 
     # Object selector
     obj = st.selectbox("Salesforce / Target Object", SUPPORTED_OBJECTS)
