@@ -224,7 +224,7 @@ with st.sidebar:
 
     # Job name
     short_desc = st.text_input("Job Short Description (e.g. 'Apollo Load')", value="")
-        if short_desc:
+    if short_desc:
         jn = f"{short_desc.replace(' ', '_')}_{today_str()}"
     else:
         jn = f"FFIS_job_{today_str()}"
