@@ -1,47 +1,41 @@
-# fly.toml — FFIS Flat File Scrubber
-# Deploy with: fly deploy
-# Docs: https://fly.io/docs/reference/configuration/
+# fly.toml app configuration file generated for ffis-scrubber on 2026-06-29T10:16:19-07:00
 #
-# Required secrets (set once, never stored here):
-#   fly secrets set ANTHROPIC_API_KEY="sk-ant-..."
-#   fly secrets set FFIS_AUTH_CONFIG="$(cat auth_config.yaml | base64)"
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
-# App name must match what was registered with: fly launch --no-deploy
-# The Cloudflare tunnel in FFIS_Flyio_Runbook.md points to ffis-scrubber.fly.dev
 
-app            = "ffis-scrubber"
-primary_region = "sjc"
+app = 'ffis-scrubber'
+primary_region = 'sjc'
 
 [build]
-  # Uses the Dockerfile in the repo root
 
 [env]
-  STREAMLIT_PAGE_TITLE    = "Flat File Scrubber"
-  STREAMLIT_PAGE_ICON     = "🧹"
-  STREAMLIT_LAYOUT        = "wide"
-  STREAMLIT_SIDEBAR_STATE = "expanded"
-  UNDO_HISTORY_LIMIT      = "20"
-  API_REQUEST_TIMEOUT     = "30"
+  API_REQUEST_TIMEOUT = '30'
+  STREAMLIT_LAYOUT = 'wide'
+  STREAMLIT_PAGE_ICON = '🧹'
+  STREAMLIT_PAGE_TITLE = 'Flat File Scrubber'
+  STREAMLIT_SIDEBAR_STATE = 'expanded'
+  UNDO_HISTORY_LIMIT = '20'
 
 [http_service]
-  internal_port        = 8501
-  force_https          = true
-  auto_stop_machines   = false   # always-on — no cold starts for a data tool
-  auto_start_machines  = true
+  internal_port = 8501
+  force_https = true
+  auto_stop_machines = 'off'
+  auto_start_machines = true
   min_machines_running = 1
 
   [http_service.concurrency]
-    type       = "connections"
+    type = 'connections'
     hard_limit = 25
     soft_limit = 20
 
-[[http_service.checks]]
-  grace_period = "30s"
-  interval     = "15s"
-  method       = "GET"
-  timeout      = "5s"
-  path         = "/_stcore/health"
+  [[http_service.checks]]
+    interval = '15s'
+    timeout = '5s'
+    grace_period = '30s'
+    method = 'GET'
+    path = '/_stcore/health'
 
 [[vm]]
-  memory = "2gb"
-  cpus   = 1
+  memory = '2gb'
+  cpus = 1
+  memory_mb = 2048
