@@ -160,7 +160,7 @@ def init_state():
         "dupes_df":         pd.DataFrame(),
         "bad_df":           pd.DataFrame(),
         "sf_dupes_df":      pd.DataFrame(),
-        "job_name":         "",
+        "job_name":         f"FFIS_job_{datetime.now().strftime('%d%m%Y')}",
         "object_type":      "",
         "has_header":       True,
         "sf_id_col":        None,
@@ -223,11 +223,13 @@ with st.sidebar:
     st.divider()
 
     # Job name
-    short_desc = st.text_input("Job Short Description (e.g. 'Apollo Load')", value="")
-    if short_desc:
-        jn = f"{short_desc.replace(' ', '_')}_{today_str()}"
-        st.session_state.job_name = jn
-        st.code(jn, language=None)
+ short_desc = st.text_input("Job Short Description (e.g. 'Apollo Load')", value="")
+if short_desc:
+    jn = f"{short_desc.replace(' ', '_')}_{today_str()}"
+else:
+    jn = f"FFIS_job_{today_str()}"
+st.session_state.job_name = jn
+st.code(jn, language=None)
 
     # Object selector
     obj = st.selectbox("Salesforce / Target Object", SUPPORTED_OBJECTS)
