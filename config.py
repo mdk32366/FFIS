@@ -30,12 +30,19 @@ def load_env_file():
                             key, value = line.split("=", 1)
                             key = key.strip()
                             value = value.strip()
+                            # Strip an inline comment (" # ...") unless the value
+                            # is quoted — protects values that contain '#',
+                            # e.g. SPECIAL_CHARS_PATTERN.
+                            if value[:1] not in ('"', "'") and " #" in value:
+                                value = value.split(" #", 1)[0].strip()
+                            # Remove matching surrounding quotes if present.
+                            if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+                                value = value[1:-1]
                             # Only set if not already in environment
                             if key not in os.environ:
                                 os.environ[key] = value
         except IOError as e:
             print(f"Warning: Could not read .env file ({e})")
-
 # Load .env file on import
 load_env_file()
 
