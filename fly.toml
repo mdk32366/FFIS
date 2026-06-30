@@ -15,7 +15,19 @@ primary_region = 'sjc'
   STREAMLIT_PAGE_TITLE = 'Flat File Scrubber'
   STREAMLIT_SIDEBAR_STATE = 'expanded'
   UNDO_HISTORY_LIMIT = '20'
-
+  IMAP_HOST = "imap.gmail.com"
+  IMAP_PORT = "993"
+  IMAP_USE_SSL = "true"
+  IMAP_FOLDER = "INBOX"
+  SMTP_HOST = "smtp.gmail.com"
+  SMTP_PORT = "587"
+  FFIS_PIPELINE_ONLY_UNSEEN = "true"
+  FFIS_PIPELINE_MARK_SEEN = "true"
+  FFIS_PIPELINE_REPLY = "true"
+  FFIS_DEDUP_BACKEND = "auto"
+  FFIS_EXPORT_GOOD = "false"
+  FFIS_EXPORT_BACKEND = "auto"
+  FFIS_EXPORT_IF_EXISTS = "append"
 [http_service]
   internal_port = 8501
   force_https = true
