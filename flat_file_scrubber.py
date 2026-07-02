@@ -18,6 +18,7 @@ import imaplib
 import email as email_lib
 import requests
 import streamlit_authenticator as stauth
+from ffis_worker_status import render_worker_status
 from datetime import datetime
 from pathlib import Path
 from email.mime.text import MIMEText
@@ -211,6 +212,7 @@ def csv_bytes(df: pd.DataFrame) -> bytes:
 # SIDEBAR — JOB SETUP & NAVIGATION
 # ──────────────────────────────────────────────
 with st.sidebar:
+    render_worker_status_compact()   # directly under the subtitle line, same indentation
     st.markdown("### 🧹 Flat File Scrubber")
     st.caption("SFCOE · Data Steward Toolkit")
     st.divider()

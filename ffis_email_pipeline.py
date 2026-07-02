@@ -125,6 +125,43 @@ except Exception:  # pragma: no cover
 
 log = logging.getLogger("ffis.pipeline")
 
+def get_allowed_senders() -> list[str]:
+    """
+    Parse FFIS_ALLOWED_SENDERS into a normalized list of matchers.
+    Empty/unset => [] => allow all senders (open intake, current behavior).
+    Entries may be full addresses ('jane@sfcoe.org') or domains
+    ('@sfcoe.org' or 'sfcoe.org'). Case-insensitive.
+    """
+    raw = os.environ.get("FFIS_ALLOWED_SENDERS", "").strip()
+    if not raw:
+        return []
+    out = []
+    for part in raw.split(","):
+        p = part.strip().lower()
+        if not p:
+            continue
+        # normalize bare domains to '@domain' so matching is unambiguous
+        if "@" not in p:
+            p = "@" + p
+        out.append(p)
+    return out
+
+
+def sender_allowed(sender: str, allow: list[str]) -> bool:
+    """True if sender matches the allowlist, or the allowlist is empty."""
+    if not allow:
+        return True  # open intake
+    s = (sender or "").strip().lower()
+    if not s:
+        return False
+    for m in allow:
+        if m.startswith("@"):
+            if s.endswith(m):        # domain match
+                return True
+        elif s == m:                 # exact address match
+            return True
+    return False
+
 # Anthropic model — kept in sync with ffis_chat.py
 ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
 
@@ -938,6 +975,11 @@ def process_message(m: InboundMessage, dedup: DedupSource, cfg: Dict[str, Any],
                     send: bool = True, exporter: Optional[Exporter] = None) -> List[RoutingResult]:
     """Process every attachment in one inbound email; reply once per attachment."""
     out: List[RoutingResult] = []
+    allow = get_allowed_senders()
+    if not sender_allowed(m.sender, allow):
+        log.warning("BLOCKED sender %s (not in FFIS_ALLOWED_SENDERS); skipping %d attachment(s).",
+                    m.sender or "(empty)", len(m.attachments))
+        return out
     for fname, data in m.attachments:
         try:
             df = read_csv_bytes(data, fname)
