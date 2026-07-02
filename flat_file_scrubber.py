@@ -19,6 +19,7 @@ import email as email_lib
 import requests
 import streamlit_authenticator as stauth
 from ffis_worker_status import render_worker_status
+from ffis_worker_status import render_worker_status_compact
 from datetime import datetime
 from pathlib import Path
 from email.mime.text import MIMEText
