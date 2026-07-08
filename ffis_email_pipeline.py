@@ -16,10 +16,11 @@ Flow
          required-field coverage, sample rows).
       d. Route every record into one of three layers:
            - good       : required fields present + acceptable values/types
-           - duplicate  : matches an existing record (reference CSV today,
-                          Snowflake when configured) or repeats within file
+           - duplicate  : matches an existing record (reference CSV, Snowflake,
+                          or a live Salesforce query) or repeats within file
            - bad        : everything else (missing required / bad values)
-      e. Optionally auto-export the good layer onward (Snowflake / REST API).
+      e. Optionally auto-export the good layer onward (Snowflake / Salesforce /
+         generic REST API).
 3.  Reply to the original sender with the three layers as CSV attachments
     plus a human-readable shape + summary report (including export status).
 
@@ -28,12 +29,30 @@ cron job, a Fly.io worker, or a one-shot CLI invocation. It reuses the
 existing project config (`config.py`) and Snowflake helper
 (`snowflake_connector.py`).
 
+Salesforce auth
+---------------
+Two authentication modes are supported by `SalesforceConnector`, selected via
+`SF_AUTH_MODE` (or auto-detected from whichever credentials are present):
+
+  * "connected_app" — OAuth 2.0 using a Connected App's consumer key/secret.
+      - grant "client_credentials" (server-to-server; requires a run-as user
+        configured on the Connected App), or
+      - grant "password" (Connected App consumer key/secret + a Salesforce
+        username / password / security-token).
+  * "password" — legacy OAuth 2.0 username-password flow. Still needs a
+      Connected App's consumer key/secret plus username + password + token,
+      but is kept as an explicit mode for clarity.
+
+Either way FFIS never performs an interactive browser OAuth dance — it uses
+the token endpoint directly so it can run head-less.
+
 CLI
 ---
     python ffis_email_pipeline.py --once            # process inbox one time
     python ffis_email_pipeline.py --watch --interval 120
     python ffis_email_pipeline.py --file sample.csv  # offline test, no email
     python ffis_email_pipeline.py --once --export    # force good-layer export on
+    python ffis_email_pipeline.py --sf-test          # test Salesforce auth only
 
 See PIPELINE_SETUP.md for the environment variables / secrets.json keys it reads.
 """
@@ -50,6 +69,7 @@ import os
 import re
 import smtplib
 import sys
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from email.header import decode_header, make_header
@@ -123,6 +143,13 @@ except Exception:  # pragma: no cover
     query_snowflake = None
     get_snowflake_config = lambda: None  # noqa: E731
 
+# Salesforce config helper is optional — if config.py exposes get_salesforce_config()
+# we use it; otherwise SalesforceConnector reads env / secrets directly below.
+try:
+    from config import get_salesforce_config as _cfg_get_salesforce_config
+except Exception:  # pragma: no cover
+    _cfg_get_salesforce_config = None
+
 log = logging.getLogger("ffis.pipeline")
 
 def get_allowed_senders() -> list[str]:
@@ -164,6 +191,315 @@ def sender_allowed(sender: str, allow: list[str]) -> bool:
 
 # Anthropic model — kept in sync with ffis_chat.py
 ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 0. SALESFORCE CONNECTOR  (Connected App OAuth  +  username-password-token)
+# ══════════════════════════════════════════════════════════════════════════
+def get_salesforce_config() -> Dict[str, Any]:
+    """
+    Resolve Salesforce settings from config.py (if it exposes
+    get_salesforce_config), otherwise from environment variables / secrets.
+
+    Recognized keys (all optional until you use the connector):
+
+      SF_AUTH_MODE          "connected_app" | "password" | "auto"  (default auto)
+      SF_GRANT_TYPE         "client_credentials" | "password"      (connected_app)
+      SF_LOGIN_URL          https://login.salesforce.com  (or test.salesforce.com
+                            for sandboxes, or your My Domain URL)
+      SF_CLIENT_ID          Connected App consumer key
+      SF_CLIENT_SECRET      Connected App consumer secret
+      SF_USERNAME           integration user's username
+      SF_PASSWORD           integration user's password
+      SF_SECURITY_TOKEN     integration user's security token (appended to pw)
+      SF_API_VERSION        e.g. "v58.0"  (default v58.0)
+      SF_DOMAIN             optional; convenience -> builds SF_LOGIN_URL
+    """
+    if _cfg_get_salesforce_config is not None:
+        try:
+            cfg = _cfg_get_salesforce_config() or {}
+            if cfg:
+                return cfg
+        except Exception as e:  # noqa: BLE001
+            log.warning("config.get_salesforce_config() failed, using env: %s", e)
+
+    login_url = getenv_str("SF_LOGIN_URL", "")
+    if not login_url:
+        domain = getenv_str("SF_DOMAIN", "").strip()
+        if domain:
+            if not domain.startswith("http"):
+                domain = "https://" + domain
+            login_url = domain
+        else:
+            login_url = "https://login.salesforce.com"
+
+    return {
+        "auth_mode": getenv_str("SF_AUTH_MODE", "auto"),
+        "grant_type": getenv_str("SF_GRANT_TYPE", "password"),
+        "login_url": login_url.rstrip("/"),
+        "client_id": getenv_str("SF_CLIENT_ID", ""),
+        "client_secret": getenv_str("SF_CLIENT_SECRET", ""),
+        "username": getenv_str("SF_USERNAME", ""),
+        "password": getenv_str("SF_PASSWORD", ""),
+        "security_token": getenv_str("SF_SECURITY_TOKEN", ""),
+        "api_version": getenv_str("SF_API_VERSION", "v58.0"),
+    }
+
+
+class SalesforceAuthError(RuntimeError):
+    """Raised when a Salesforce token cannot be obtained."""
+
+
+@dataclass
+class SalesforceConnector:
+    """
+    Minimal, dependency-light Salesforce client for head-less use.
+
+    Handles two OAuth 2.0 flows against the token endpoint:
+
+      * Connected App, grant_type=client_credentials
+          POST /services/oauth2/token
+          client_id, client_secret            (run-as user set on the app)
+      * Connected App / legacy, grant_type=password
+          POST /services/oauth2/token
+          client_id, client_secret, username,
+          password + security_token
+
+    On success it caches `access_token` and `instance_url` and exposes:
+      - query(soql)          -> list[dict]           (REST /query)
+      - insert(object, rows) -> list[dict] results   (Composite sObjects)
+      - test_connection()    -> dict (identity summary)
+
+    Requires the `requests` package (already used elsewhere for API export).
+    """
+    login_url: str = "https://login.salesforce.com"
+    client_id: str = ""
+    client_secret: str = ""
+    username: str = ""
+    password: str = ""
+    security_token: str = ""
+    auth_mode: str = "auto"          # "connected_app" | "password" | "auto"
+    grant_type: str = "password"     # used when auth_mode resolves to connected_app
+    api_version: str = "v58.0"
+
+    access_token: Optional[str] = field(default=None, init=False)
+    instance_url: Optional[str] = field(default=None, init=False)
+    _authed: bool = field(default=False, init=False)
+
+    # ---- construction ----------------------------------------------------
+    @classmethod
+    def from_config(cls, cfg: Optional[Dict[str, Any]] = None) -> "SalesforceConnector":
+        cfg = cfg or get_salesforce_config()
+        return cls(
+            login_url=cfg.get("login_url", "https://login.salesforce.com").rstrip("/"),
+            client_id=cfg.get("client_id", ""),
+            client_secret=cfg.get("client_secret", ""),
+            username=cfg.get("username", ""),
+            password=cfg.get("password", ""),
+            security_token=cfg.get("security_token", ""),
+            auth_mode=cfg.get("auth_mode", "auto"),
+            grant_type=cfg.get("grant_type", "password"),
+            api_version=cfg.get("api_version", "v58.0"),
+        )
+
+    # ---- helpers ---------------------------------------------------------
+    def _resolve_mode(self) -> str:
+        """Decide which flow to run when auth_mode == 'auto'."""
+        mode = (self.auth_mode or "auto").lower()
+        if mode in ("connected_app", "password"):
+            return mode
+        # auto: if we have a username+password, use the password grant (most
+        # common for FFIS integration users); otherwise try client_credentials.
+        if self.username and self.password:
+            return "password"
+        if self.client_id and self.client_secret:
+            return "connected_app"
+        raise SalesforceAuthError(
+            "No Salesforce credentials found. Set SF_CLIENT_ID/SF_CLIENT_SECRET "
+            "and either SF_USERNAME/SF_PASSWORD/SF_SECURITY_TOKEN (password grant) "
+            "or configure a run-as user for the client_credentials grant."
+        )
+
+    def _token_endpoint(self) -> str:
+        return f"{self.login_url}/services/oauth2/token"
+
+    def _build_payload(self, mode: str) -> Dict[str, str]:
+        """
+        Build the form-encoded token request body.
+
+        'password'         -> OAuth username-password flow. Salesforce wants the
+                              security token appended directly to the password.
+        'connected_app'    -> either client_credentials (no user) or password,
+                              controlled by self.grant_type.
+        """
+        if mode == "password":
+            grant = "password"
+        else:  # connected_app
+            grant = (self.grant_type or "password").lower()
+
+        if grant == "client_credentials":
+            if not (self.client_id and self.client_secret):
+                raise SalesforceAuthError(
+                    "client_credentials grant needs SF_CLIENT_ID and SF_CLIENT_SECRET."
+                )
+            return {
+                "grant_type": "client_credentials",
+                "client_id": self.client_id,
+                "client_secret": self.client_secret,
+            }
+
+        # password grant (used by both 'password' mode and connected_app+password)
+        missing = [n for n, v in (
+            ("SF_CLIENT_ID", self.client_id),
+            ("SF_CLIENT_SECRET", self.client_secret),
+            ("SF_USERNAME", self.username),
+            ("SF_PASSWORD", self.password),
+        ) if not v]
+        if missing:
+            raise SalesforceAuthError(
+                "password grant is missing: " + ", ".join(missing) +
+                " (SF_SECURITY_TOKEN may also be required unless the app's IP is "
+                "allow-listed)."
+            )
+        return {
+            "grant_type": "password",
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+            "username": self.username,
+            "password": f"{self.password}{self.security_token or ''}",
+        }
+
+    # ---- auth ------------------------------------------------------------
+    def authenticate(self, force: bool = False) -> None:
+        """Obtain and cache an access token + instance URL."""
+        if self._authed and not force:
+            return
+        try:
+            import requests
+        except Exception as e:  # noqa: BLE001
+            raise SalesforceAuthError(f"requests unavailable: {e}")
+
+        mode = self._resolve_mode()
+        payload = self._build_payload(mode)
+        try:
+            resp = requests.post(
+                self._token_endpoint(), data=payload,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=30,
+            )
+        except Exception as e:  # noqa: BLE001
+            raise SalesforceAuthError(f"token request failed: {e}")
+
+        if resp.status_code != 200:
+            # Salesforce returns a JSON {error, error_description} on failure.
+            detail = resp.text[:300]
+            try:
+                j = resp.json()
+                detail = f"{j.get('error')}: {j.get('error_description')}"
+            except Exception:
+                pass
+            raise SalesforceAuthError(
+                f"auth failed ({resp.status_code}) via {mode}/"
+                f"{payload.get('grant_type')}: {detail}"
+            )
+
+        data = resp.json()
+        self.access_token = data.get("access_token")
+        self.instance_url = (data.get("instance_url") or "").rstrip("/")
+        if not (self.access_token and self.instance_url):
+            raise SalesforceAuthError(
+                "auth response missing access_token/instance_url: "
+                f"{list(data.keys())}"
+            )
+        self._authed = True
+        log.info("Salesforce auth OK via %s/%s -> %s",
+                 mode, payload.get("grant_type"), self.instance_url)
+
+    def _headers(self) -> Dict[str, str]:
+        self.authenticate()
+        return {
+            "Authorization": f"Bearer {self.access_token}",
+            "Content-Type": "application/json",
+        }
+
+    def _base(self) -> str:
+        self.authenticate()
+        return f"{self.instance_url}/services/data/{self.api_version}"
+
+    # ---- operations ------------------------------------------------------
+    def test_connection(self) -> Dict[str, Any]:
+        """Authenticate and hit /limits as a lightweight sanity check."""
+        import requests
+        r = requests.get(f"{self._base()}/limits", headers=self._headers(), timeout=30)
+        ok = r.status_code == 200
+        return {
+            "success": ok,
+            "instance_url": self.instance_url,
+            "api_version": self.api_version,
+            "status_code": r.status_code,
+            "detail": "ok" if ok else r.text[:200],
+        }
+
+    def query(self, soql: str) -> List[Dict[str, Any]]:
+        """Run a SOQL query, following nextRecordsUrl pagination."""
+        import requests
+        records: List[Dict[str, Any]] = []
+        url = f"{self._base()}/query"
+        params: Optional[Dict[str, str]] = {"q": soql}
+        while True:
+            r = requests.get(url, headers=self._headers(), params=params, timeout=60)
+            if r.status_code != 200:
+                raise RuntimeError(f"SOQL query failed ({r.status_code}): {r.text[:200]}")
+            body = r.json()
+            records.extend(body.get("records", []))
+            nxt = body.get("nextRecordsUrl")
+            if body.get("done", True) or not nxt:
+                break
+            url = f"{self.instance_url}{nxt}"
+            params = None  # nextRecordsUrl is fully-qualified
+        return records
+
+    def insert(self, object_type: str, rows: List[Dict[str, Any]],
+               all_or_none: bool = False, batch_size: int = 200) -> Dict[str, Any]:
+        """
+        Insert records via the Composite sObjects collections endpoint
+        (up to 200 per call). Returns a summary with per-record results.
+        """
+        import requests
+        if not rows:
+            return {"success": True, "created": 0, "errors": [], "results": []}
+        endpoint = f"{self._base()}/composite/sobjects"
+        created, errors, results = 0, [], []
+        for i in range(0, len(rows), min(batch_size, 200)):
+            chunk = rows[i:i + min(batch_size, 200)]
+            payload = {
+                "allOrNone": all_or_none,
+                "records": [{"attributes": {"type": object_type}, **row} for row in chunk],
+            }
+            r = requests.post(endpoint, headers=self._headers(),
+                              data=json.dumps(payload), timeout=60)
+            if r.status_code not in (200, 201):
+                errors.append(f"batch @ {i}: {r.status_code} {r.text[:120]}")
+                continue
+            for res in r.json():
+                results.append(res)
+                if res.get("success"):
+                    created += 1
+                else:
+                    errors.append(res.get("errors"))
+        return {"success": len(errors) == 0, "created": created,
+                "errors": errors, "results": results}
+
+
+def salesforce_available() -> bool:
+    """True if enough Salesforce config is present to attempt auth."""
+    cfg = get_salesforce_config()
+    has_app = bool(cfg.get("client_id") and cfg.get("client_secret"))
+    has_pw = bool(cfg.get("username") and cfg.get("password"))
+    mode = (cfg.get("auth_mode") or "auto").lower()
+    if mode == "connected_app" and (cfg.get("grant_type") == "client_credentials"):
+        return has_app
+    return has_app and (has_pw or mode == "connected_app")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -316,14 +652,57 @@ class Classification:
     reasoning: str = ""
 
 
+def _canon(name: str) -> str:
+    """Canonical form for fuzzy field-name matching: lowercase, alphanumerics only."""
+    return re.sub(r"[^a-z0-9]", "", str(name).strip().lower())
+
+
+# Common human-readable header variants -> the canonical Salesforce-style
+# token they should be treated as equivalent to (both sides run through
+# _canon() before lookup, so spacing/case/punctuation don't matter).
+_FIELD_ALIASES: Dict[str, str] = {
+    "emailaddress": "email",
+    "emailaddr": "email",
+    "phonenumber": "phone",
+    "directphonenumber": "phone",
+    "mobilephonenumber": "mobilephone",
+    "cellphone": "mobilephone",
+    "cellphonenumber": "mobilephone",
+    "companyname": "company",
+    "accountname": "name",
+    "fullname": "name",
+    "jobtitle": "title",
+    "positiontitle": "title",
+}
+
+
+def _canon_with_alias(name: str) -> str:
+    c = _canon(name)
+    return _FIELD_ALIASES.get(c, c)
+
+
+def resolve_column(df_columns, target_field: str) -> Optional[str]:
+    """
+    Find the actual column in df_columns that corresponds to a Salesforce
+    API field name (e.g. 'LastName'), tolerating human-readable variants
+    like 'Last Name' or 'Email Address'. Returns the original column
+    label as it appears in the file, or None if no match is found.
+    """
+    target_canon = _canon_with_alias(target_field)
+    for col in df_columns:
+        if _canon_with_alias(col) == target_canon:
+            return col
+    return None
+
+
 def _normalize_cols(df: pd.DataFrame) -> List[str]:
-    return [str(c).strip().lower() for c in df.columns]
+    return [_canon_with_alias(c) for c in df.columns]
 
 
 def heuristic_classify(df: pd.DataFrame, allowed: List[str]) -> Classification:
     """Score the file's columns against known object signatures."""
     cols = set(_normalize_cols(df))
-    required = {k.lower(): [c.lower() for c in v] for k, v in get_required_fields().items()}
+    required = {k.lower(): [_canon_with_alias(c) for c in v] for k, v in get_required_fields().items()}
     best_obj, best_score = None, -1.0
     for obj in allowed:
         sig = _OBJECT_SIGNATURES.get(obj, set())
@@ -414,7 +793,8 @@ def infer_shape(df: pd.DataFrame, object_type: str) -> Dict[str, Any]:
     required = get_required_fields().get(object_type, [])
     present_cols = list(df.columns)
     null_counts = {c: int(df[c].isna().sum()) for c in present_cols}
-    missing_required = [c for c in required if c not in present_cols]
+    field_map = {rf: resolve_column(present_cols, rf) for rf in required}
+    missing_required = [rf for rf, actual in field_map.items() if actual is None]
     return {
         "rows": int(df.shape[0]),
         "columns": int(df.shape[1]),
@@ -422,8 +802,9 @@ def infer_shape(df: pd.DataFrame, object_type: str) -> Dict[str, Any]:
         "dtypes": {c: str(df[c].dtype) for c in present_cols},
         "null_counts": null_counts,
         "required_fields": required,
-        "required_present": [c for c in required if c in present_cols],
+        "required_present": [rf for rf, actual in field_map.items() if actual is not None],
         "required_missing_columns": missing_required,
+        "required_field_map": {rf: actual for rf, actual in field_map.items() if actual},
     }
 
 
@@ -479,18 +860,19 @@ def validate_records(df: pd.DataFrame, object_type: str) -> Tuple[pd.Series, Lis
       * every value present passes its type/format rule
     """
     required = get_required_fields().get(object_type, [])
-    present_required = [c for c in required if c in df.columns]
-    missing_cols = [c for c in required if c not in df.columns]
+    field_map = {rf: resolve_column(df.columns, rf) for rf in required}
+    missing_cols = [rf for rf, actual in field_map.items() if actual is None]
+    present_required = [(rf, actual) for rf, actual in field_map.items() if actual is not None]
 
     reasons: List[List[str]] = []
     good = []
     for _, row in df.iterrows():
         row_reasons: List[str] = []
-        for c in missing_cols:
-            row_reasons.append(f"{c}: required column missing from file")
-        for c in present_required:
-            if _is_blank(row.get(c)):
-                row_reasons.append(f"{c}: required value is blank")
+        for rf in missing_cols:
+            row_reasons.append(f"{rf}: required column missing from file")
+        for rf, actual_col in present_required:
+            if _is_blank(row.get(actual_col)):
+                row_reasons.append(f"{rf}: required value is blank")
         for c in df.columns:
             err = _validate_value(str(c), row.get(c))
             if err:
@@ -501,7 +883,7 @@ def validate_records(df: pd.DataFrame, object_type: str) -> Tuple[pd.Series, Lis
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 4. DEDUP  (pluggable: CSV reference now, Snowflake-ready interface)
+# 4. DEDUP  (pluggable: CSV reference, Snowflake, or live Salesforce)
 # ══════════════════════════════════════════════════════════════════════════
 # Preferred match keys per object. Resolved against columns actually present;
 # falls back to required fields, then to the full row.
@@ -517,12 +899,20 @@ _DEDUP_KEYS: Dict[str, List[str]] = {
 
 
 def resolve_key_columns(df: pd.DataFrame, object_type: str) -> List[str]:
-    """Pick the dedup key columns that actually exist in this file."""
+    """Pick the dedup key columns that actually exist in this file (fuzzy-matched)."""
     preferred = _DEDUP_KEYS.get(object_type, [])
-    keys = [c for c in preferred if c in df.columns]
+    keys = []
+    for pk in preferred:
+        actual = resolve_column(df.columns, pk)
+        if actual:
+            keys.append(actual)
     if keys:
         return keys
-    req = [c for c in get_required_fields().get(object_type, []) if c in df.columns]
+    req = []
+    for rf in get_required_fields().get(object_type, []):
+        actual = resolve_column(df.columns, rf)
+        if actual:
+            req.append(actual)
     if req:
         return req
     return list(df.columns)  # last resort: whole-row dedup
@@ -639,11 +1029,64 @@ class SnowflakeDedup(DedupSource):
         return out
 
 
+class SalesforceDedup(DedupSource):
+    """
+    Match against live records in Salesforce via SOQL.
+
+    Uses the SalesforceConnector to query only the key columns for the target
+    object, so dedup reflects the current state of the org rather than a stale
+    CSV export. Object names with spaces (e.g. relationships) won't map to a
+    standard SObject, so those fall back to an empty set (handled upstream by
+    CSV/Snowflake backends instead).
+    """
+    name = "salesforce"
+
+    # Map FFIS object labels to Salesforce SObject API names where they differ.
+    _SOBJECT_MAP: Dict[str, str] = {
+        "Account to Account Relationship": "AccountRelationship",
+        "Account to Contact Relationship": "AccountContactRelation",
+    }
+
+    def __init__(self, connector: Optional[SalesforceConnector] = None):
+        self.connector = connector or SalesforceConnector.from_config()
+
+    def _sobject_for(self, object_type: str) -> str:
+        return self._SOBJECT_MAP.get(object_type, object_type)
+
+    def existing_keys(self, object_type: str, keys: List[str]) -> set:
+        if not keys:
+            return set()
+        sobject = self._sobject_for(object_type)
+        # Only query fields that are plausibly real API names (skip whitespace).
+        fields = [k for k in keys if k and " " not in k]
+        if not fields:
+            return set()
+        soql = f"SELECT {', '.join(fields)} FROM {sobject}"
+        try:
+            records = self.connector.query(soql)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Salesforce dedup query failed for %s: %s", sobject, e)
+            return set()
+        out = set()
+        for rec in records:
+            parts = []
+            for k in keys:
+                v = rec.get(k)
+                parts.append("" if v is None else str(v).strip().lower())
+            out.add("||".join(parts))
+        return out
+
+
 def make_dedup_source(backend: str = "auto", reference_dir: str = "") -> DedupSource:
-    """Factory. 'auto' uses Snowflake when configured, else CSV, else none."""
+    """
+    Factory. 'auto' prefers Snowflake, then live Salesforce, then CSV, else none.
+    Explicit backends: 'snowflake' | 'salesforce' | 'csv' | 'none'.
+    """
     backend = (backend or "auto").lower()
     if backend == "snowflake":
         return SnowflakeDedup()
+    if backend == "salesforce":
+        return SalesforceDedup()
     if backend == "csv":
         return CsvReferenceDedup(reference_dir)
     if backend == "none":
@@ -651,6 +1094,8 @@ def make_dedup_source(backend: str = "auto", reference_dir: str = "") -> DedupSo
     # auto
     if get_snowflake_config and get_snowflake_config():
         return SnowflakeDedup()
+    if salesforce_available():
+        return SalesforceDedup()
     if reference_dir and os.path.isdir(reference_dir):
         return CsvReferenceDedup(reference_dir)
     return NullDedup()
@@ -670,7 +1115,7 @@ def duplicate_mask(df: pd.DataFrame, object_type: str, source: DedupSource) -> p
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 4b. EXPORT  (pluggable: load the GOOD layer onward — Snowflake / REST API)
+# 4b. EXPORT  (pluggable: load the GOOD layer onward — Snowflake / SF / REST)
 # ══════════════════════════════════════════════════════════════════════════
 class Exporter(ABC):
     """Strategy interface for loading the good layer into a destination."""
@@ -728,6 +1173,45 @@ class SnowflakeExporter(Exporter):
                     "table": table, "error": str(e)}
 
 
+class SalesforceExporter(Exporter):
+    """
+    Insert the good layer directly into Salesforce via the Composite sObjects
+    endpoint. Authenticates through SalesforceConnector (Connected App OAuth or
+    username-password-token). Batches at 200 (Composite max).
+    """
+    name = "salesforce"
+
+    def __init__(self, connector: Optional[SalesforceConnector] = None,
+                 all_or_none: bool = False, batch_size: int = 200):
+        self.connector = connector or SalesforceConnector.from_config()
+        self.all_or_none = all_or_none
+        self.batch_size = batch_size
+
+    def export(self, df: pd.DataFrame, object_type: str) -> Dict[str, Any]:
+        if df is None or df.empty:
+            return {"success": True, "skipped": True, "reason": "empty good layer",
+                    "destination": "salesforce", "rows": 0}
+        sobject = SalesforceDedup._SOBJECT_MAP.get(object_type, object_type)
+        # Drop all-null columns and NaN cells so Salesforce doesn't reject blanks.
+        rows: List[Dict[str, Any]] = []
+        for rec in df.to_dict(orient="records"):
+            rows.append({k: v for k, v in rec.items()
+                         if v is not None and not (isinstance(v, float) and pd.isna(v))
+                         and str(v).strip() != ""})
+        try:
+            result = self.connector.insert(
+                sobject, rows, all_or_none=self.all_or_none,
+                batch_size=self.batch_size,
+            )
+        except Exception as e:  # noqa: BLE001
+            return {"success": False, "destination": "salesforce",
+                    "sobject": sobject, "error": str(e)}
+        return {"success": result.get("success", False), "destination": "salesforce",
+                "sobject": sobject, "rows": int(len(rows)),
+                "created": result.get("created", 0),
+                "errors": result.get("errors", [])[:10]}
+
+
 class ApiExporter(Exporter):
     """
     POST the good layer to a REST endpoint in batches (e.g. a Salesforce
@@ -774,17 +1258,24 @@ class ApiExporter(Exporter):
 
 
 def make_exporter(backend: str = "auto", if_exists: str = "append") -> Exporter:
-    """Factory. 'auto' uses Snowflake if configured, else API if an endpoint is set."""
+    """
+    Factory. 'auto' prefers Snowflake, then Salesforce, then generic API.
+    Explicit: 'snowflake' | 'salesforce' | 'api' | 'none'.
+    """
     backend = (backend or "auto").lower()
     if backend == "none":
         return NoneExporter()
     if backend == "snowflake":
         return SnowflakeExporter(if_exists=if_exists)
+    if backend == "salesforce":
+        return SalesforceExporter()
     if backend == "api":
         return ApiExporter()
     # auto
     if get_snowflake_config and get_snowflake_config():
         return SnowflakeExporter(if_exists=if_exists)
+    if salesforce_available():
+        return SalesforceExporter()
     if get_api_config().get("endpoint_url"):
         return ApiExporter()
     return NoneExporter()
@@ -900,8 +1391,8 @@ def build_summary(result: RoutingResult) -> str:
         if es.get("skipped"):
             lines.append(f"  Destination {dest}: skipped ({es.get('reason', 'disabled')}).")
         elif es.get("success"):
-            tgt = es.get("table") or es.get("endpoint") or dest
-            sent = es.get("rows_sent", es.get("rows"))
+            tgt = es.get("table") or es.get("sobject") or es.get("endpoint") or dest
+            sent = es.get("created", es.get("rows_sent", es.get("rows")))
             lines.append(f"  Loaded {sent} record(s) to {dest}: {tgt}.")
         else:
             lines.append(f"  Destination {dest}: FAILED — {es.get('error') or es.get('errors')}")
@@ -1030,7 +1521,6 @@ def run_once(send: bool = True) -> List[RoutingResult]:
 
 
 def run_watch(interval: int = 120, send: bool = True) -> None:
-    import time
     log.info("Watching inbox every %ds. Ctrl-C to stop.", interval)
     while True:
         try:
@@ -1054,12 +1544,30 @@ def process_local_file(path: str) -> RoutingResult:
     return result
 
 
+def test_salesforce_auth() -> int:
+    """Authenticate against Salesforce and print a short status. CLI: --sf-test."""
+    try:
+        conn = SalesforceConnector.from_config()
+        status = conn.test_connection()
+    except Exception as e:  # noqa: BLE001
+        print(f"Salesforce auth FAILED: {e}")
+        return 1
+    if status.get("success"):
+        print(f"Salesforce auth OK -> {status['instance_url']} "
+              f"(API {status['api_version']})")
+        return 0
+    print(f"Salesforce reachable but /limits returned {status.get('status_code')}: "
+          f"{status.get('detail')}")
+    return 1
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(description="FFIS automated email ingestion pipeline.")
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--once", action="store_true", help="Poll the inbox a single time.")
     g.add_argument("--watch", action="store_true", help="Poll continuously.")
     g.add_argument("--file", metavar="CSV", help="Classify+route a local CSV (no email).")
+    g.add_argument("--sf-test", action="store_true", help="Test Salesforce auth and exit.")
     p.add_argument("--interval", type=int, default=120, help="Seconds between polls (--watch).")
     p.add_argument("--no-send", action="store_true", help="Process but do not send replies.")
     p.add_argument("--export", dest="export", action="store_true", default=None,
@@ -1077,9 +1585,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-# Keep third-party HTTP/SDK debug noise (and row data) out of --verbose.
-    for _noisy in ("anthropic", "httpx", "httpcore"):
+    # Keep third-party HTTP/SDK debug noise (and row data) out of --verbose.
+    for _noisy in ("anthropic", "httpx", "httpcore", "urllib3"):
         logging.getLogger(_noisy).setLevel(logging.WARNING)
+    if args.sf_test:
+        return test_salesforce_auth()
     if args.file:
         process_local_file(args.file)
         return 0
