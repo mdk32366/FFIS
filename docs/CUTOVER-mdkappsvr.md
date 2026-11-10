@@ -72,7 +72,9 @@ Applied via `deploy/mdkappsvr/compose.ingest.override.yaml` (repo only until Mat
 | `FFIS_ALERT_TO` | unset | alert recipient (Matt decision). Unset = CRITICAL log + stall.json only |
 
 - **Exit codes:** 70 = poll exceeded deadline; 71 = no successful IMAP leg for the stall window. Docker `restart: unless-stopped` restarts on either. Docker does **not** restart a merely *unhealthy* container.
-- **Health:** `python ffis_ingest_health.py` -> exit 0/1 plus one JSON line (ages only). It checks heartbeat freshness and in-flight age; it does **not** look at `last_result`, so a fast-failing poll loop (bad password, server refusing) reads *healthy* until the exit-71 window (4 x 420 s = 28 min with defaults) elapses.
+- **Health:** `python ffis_ingest_health.py` -> exit 0/1 plus one JSON line (ages only). Unhealthy if the heartbeat is missing/stale, a poll is in flight past the deadline, or `consecutive_failures` >= 3 (resets on a good poll). Compose `start_period` is 420 s (>= deadline 300 + interval 120); a hang from container start therefore recovers by exit 70 before health can turn unhealthy.
+- **Auth alert:** an IMAP LOGIN rejection sends one alert on the first failure, then at most one per hour (`last_auth_alert_at` in stall.json).
+- **Replies:** idempotent per (Message-ID, attachment index) via the `replies` table in ingest.db; a retried half-done message re-sends nothing already sent.
 - **\Seen:** in `watermark` mode `\Seen` is set only after the ledger commit and is no longer the source of truth; mail read by a human or the UI is still ingested. Poison messages are left unread.
-- **Replies:** at most one duplicate reply is possible if the process dies between `sendmail` and the ledger commit (accepted; exactly-once over SMTP is not achievable). A failed reply is logged and the message is still `done` with `reply_sent=0`.
+- **Reply crash window:** at most one duplicate reply is possible if the process dies between `sendmail` and the reply-ledger write (accepted; exactly-once over SMTP is not achievable). A failed reply is logged and the message is still `done` with `reply_sent=0`.
 - **First start / UIDVALIDITY change:** resync via `UID SEARCH UNSEEN` (first ever) or `SINCE <last done - 2 days>`; the ledger dedups by Message-ID; the watermark is rebased to UIDNEXT-1 only after the whole resync batch commits.
