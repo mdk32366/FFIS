@@ -589,6 +589,18 @@ def _imap_connect(host: str, port: int, use_ssl: bool, timeout: float,
     return M
 
 
+class IMAPAuthError(RuntimeError):
+    """IMAP LOGIN was rejected by the server (bad/rotated credential)."""
+
+
+def _imap_login(M, username: str, password: str) -> None:
+    _set_stage("login")
+    try:
+        M.login(username, password)
+    except imaplib.IMAP4.error as e:   # NO/BAD reply; never includes the password
+        raise IMAPAuthError(f"IMAP login rejected: {e}") from None
+
+
 def _imap_close(M, clean: bool) -> None:
     """LOGOUT on a clean finish; on failure skip the round-trip and shut the socket."""
     if M is None:
@@ -652,8 +664,7 @@ def fetch_inbound_messages(
     clean = False
     try:
         M = _imap_connect(host, port, use_ssl, timeout, use_starttls, ssl_context)
-        _set_stage("login")
-        M.login(username, password)
+        _imap_login(M, username, password)
         _set_stage("select")
         M.select(folder)
 
@@ -691,6 +702,8 @@ def fetch_inbound_messages(
                     _set_stage("store")
                     M.store(msg_id, "+FLAGS", "\\Seen")
         clean = True
+    except IMAPAuthError as e:
+        raise IMAPAuthError(f"IMAP error at stage={current_stage()}: {e}") from None
     except Exception as e:  # noqa: BLE001
         raise RuntimeError(f"IMAP error at stage={current_stage()}: {e}")
     finally:
@@ -1561,11 +1574,16 @@ def get_pipeline_config() -> Dict[str, Any]:
 
 def process_message(m: InboundMessage, dedup: DedupSource, cfg: Dict[str, Any],
                     send: bool = True, exporter: Optional[Exporter] = None,
-                    reply_status: Optional[List[bool]] = None) -> List[RoutingResult]:
+                    reply_status: Optional[List[bool]] = None,
+                    reply_guard: Optional[Any] = None) -> List[RoutingResult]:
     """Process every attachment in one inbound email; reply once per attachment.
 
     If ``reply_status`` is given, one bool per attempted reply is appended
     (True only after ``sendmail`` returned).
+
+    ``reply_guard`` (watermark mode) makes replies idempotent per
+    (Message-ID, attachment index): ``already(idx)`` -> skip the send,
+    ``mark(idx)`` is called only after ``sendmail`` returned.
     """
     out: List[RoutingResult] = []
     allow = get_allowed_senders()
@@ -1573,7 +1591,7 @@ def process_message(m: InboundMessage, dedup: DedupSource, cfg: Dict[str, Any],
         log.warning("BLOCKED sender %s (not in FFIS_ALLOWED_SENDERS); skipping %d attachment(s).",
                     m.sender or "(empty)", len(m.attachments))
         return out
-    for fname, data in m.attachments:
+    for att_idx, (fname, data) in enumerate(m.attachments):
         try:
             df = read_csv_bytes(data, fname)
         except Exception as e:  # noqa: BLE001
@@ -1586,10 +1604,18 @@ def process_message(m: InboundMessage, dedup: DedupSource, cfg: Dict[str, Any],
         if exporter is not None and cfg.get("export_good", False):
             result.export_status = exporter.export(result.good, result.object_type)
             log.info("Export (%s) for %s: %s", exporter.name, fname, result.export_status)
-        if send and cfg.get("reply", True) and m.sender:
+        if send and cfg.get("reply", True) and m.sender and reply_guard is not None \
+                and reply_guard.already(att_idx):
+            log.info("Reply for %s (attachment #%d) already sent per ledger; not re-sending.",
+                     fname, att_idx)
+            if reply_status is not None:
+                reply_status.append(True)
+        elif send and cfg.get("reply", True) and m.sender:
             _set_stage(f"reply:{m.msg_id.decode(errors='replace') if isinstance(m.msg_id, bytes) else m.msg_id}")
             try:
                 send_results_email(m.sender, result, in_reply_to=m.message_id_header)
+                if reply_guard is not None:
+                    reply_guard.mark(att_idx)
                 if reply_status is not None:
                     reply_status.append(True)
             except Exception as e:  # noqa: BLE001
@@ -1869,7 +1895,8 @@ def _handle_uid(M, folder, uid, uidvalidity, state, cfg, dedup, exporter, send,
     _set_stage(f"process:{uid}")
     replies: List[bool] = []
     try:
-        process_message(m, dedup, cfg, send=send, exporter=exporter, reply_status=replies)
+        process_message(m, dedup, cfg, send=send, exporter=exporter, reply_status=replies,
+                        reply_guard=_ReplyGuard(state, key))
     except Exception as e:  # noqa: BLE001
         attempts = state.record_failure(key=key, uidvalidity=uidvalidity, uid=uid,
                                         message_id=mid, internaldate=idate)
@@ -1896,6 +1923,19 @@ def _handle_uid(M, folder, uid, uidvalidity, state, cfg, dedup, exporter, send,
     return "advance"
 
 
+class _ReplyGuard:
+    """Reply idempotency for one message: ledger key (Message-ID, attachment index)."""
+
+    def __init__(self, state, message_key: str):
+        self.state, self.key = state, message_key
+
+    def already(self, idx: int) -> bool:
+        return self.state.reply_already(self.key, idx)
+
+    def mark(self, idx: int) -> None:
+        self.state.mark_reply(self.key, idx)
+
+
 def fetch_and_process_watermark(imap: Dict[str, Any], user: str, pwd: str, cfg: Dict[str, Any],
                                 dedup: DedupSource, exporter: Optional[Exporter], send: bool,
                                 icfg: Dict[str, Any], state=None) -> Dict[str, int]:
@@ -1908,11 +1948,12 @@ def fetch_and_process_watermark(imap: Dict[str, Any], user: str, pwd: str, cfg: 
         try:
             M = _imap_connect(imap["host"], imap["port"], imap["use_ssl"],
                               icfg["imap_timeout_s"], icfg["imap_starttls"])
-            _set_stage("login")
-            M.login(user, pwd)
+            _imap_login(M, user, pwd)
             stats = poll_watermark(M, imap["folder"], state, cfg, dedup, exporter, send,
                                    icfg["max_attempts"])
             clean = True
+        except IMAPAuthError as e:
+            raise IMAPAuthError(f"IMAP error at stage={current_stage()}: {e}") from None
         except Exception as e:  # noqa: BLE001
             raise RuntimeError(f"IMAP error at stage={current_stage()}: {e}")
         finally:
@@ -2057,6 +2098,16 @@ def run_poll(send: bool = True) -> bool:
     try:
         run_once(send=send)
         ok = True
+    except IMAPAuthError as e:
+        log.error("Poll cycle failed: %s", e)
+        if _ist is not None:
+            # first auth failure alerts immediately; then at most once per hour
+            _ist.send_alert("IMAP authentication failed",
+                            {"stage": "login", "error": "AUTHENTICATIONFAILED/NO from server",
+                             "consecutive_failures": (hb.data.get("consecutive_failures", 0) + 1)
+                             if hb is not None else "?"},
+                            sdir=hb.dir if hb is not None else None,
+                            rate_limit=False, dedupe_key="auth", dedupe_s=3600)
     except Exception as e:  # noqa: BLE001
         log.error("Poll cycle failed: %s", e)
     finally:

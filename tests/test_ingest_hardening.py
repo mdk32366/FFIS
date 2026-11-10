@@ -526,3 +526,98 @@ def test_X2_alert_rate_limit_and_recovered(imap, smtp, state_dir):
     ev("X2", f"alerts={[(a['subject'], a['rcpts']) for a in alerts]} stall.json={st} rate_limited_probe={r}")
     assert len(alerts) == 1 and "recovered" in alerts[0]["subject"] and st["recovered_at"]
     assert r == "rate_limited"
+
+
+# ── Trinity review changes (2026-11-10 09:24) ────────────────────────────
+def _health(sdir):
+    env = clean_env(FFIS_STATE_DIR=sdir, FFIS_POLL_DEADLINE_S=300, FFIS_WATCH_INTERVAL_S=120)
+    r = subprocess.run([sys.executable, os.path.join(REPO, "ffis_ingest_health.py")], env=env,
+                       capture_output=True, text=True, cwd=REPO, timeout=30)
+    return r.returncode, r.stdout.strip()
+
+
+def test_C2a_health_unhealthy_at_3_consecutive_failures(imap, smtp, state_dir):
+    """CHANGE 2: consecutive_failures resets on success, +1 on failure; health exit 1 at >= 3."""
+    ev_header("C2a", "consecutive_failures counter -> health unhealthy at 3")
+    add_att(imap, "c2a")
+    imap.reject_login(True)
+    env = env_for(imap, smtp, state_dir)
+    seq = []
+    for i in range(1, 4):
+        run_cli(REPO, env, ["--once"], name="C2a")
+        hb = json.load(open(os.path.join(state_dir, "heartbeat.json")))
+        rc, out = _health(state_dir)
+        seq.append((hb["consecutive_failures"], rc))
+        ev("C2a", f"after failed poll {i}: consecutive_failures={hb['consecutive_failures']} health_rc={rc} {out}")
+    imap.reject_login(False)
+    run_cli(REPO, env, ["--once"], name="C2a")
+    hb = json.load(open(os.path.join(state_dir, "heartbeat.json")))
+    rc, out = _health(state_dir)
+    seq.append((hb["consecutive_failures"], rc))
+    ev("C2a", f"after successful poll: consecutive_failures={hb['consecutive_failures']} health_rc={rc} {out}")
+    assert seq == [(1, 0), (2, 0), (3, 1), (0, 0)], seq
+
+
+def test_C2b_auth_alert_first_failure_then_hourly_dedupe(imap, smtp, state_dir):
+    """CHANGE 2: SMTP alert on the FIRST IMAP auth failure, not again within the hour."""
+    ev_header("C2b", "auth-failure alert: first failure alerts, deduped 1/hour")
+    import ffis_ingest_state as ist
+    imap.reject_login(True)
+    env = env_for(imap, smtp, state_dir, FFIS_ALERT_TO=FAKE_ALERT_TO)
+    counts = []
+    for i in range(1, 4):
+        rc, out, _ = run_cli(REPO, env, ["--once"], name="C2b")
+        n = len([a for a in smtp.replies("alert") if "authentication" in a["subject"].lower()])
+        counts.append(n)
+        ev("C2b", f"after auth-failed poll {i}: auth alerts={n}")
+    # simulate the hour elapsing -> the next failure alerts again
+    sp = os.path.join(state_dir, "stall.json")
+    st = json.load(open(sp))
+    st["last_auth_alert_at"] = ist.utcnow_iso(time.time() - 3601)
+    json.dump(st, open(sp, "w"))
+    run_cli(REPO, env, ["--once"], name="C2b")
+    n4 = len([a for a in smtp.replies("alert") if "authentication" in a["subject"].lower()])
+    ev("C2b", f"after aging last_auth_alert_at by 3601s and one more failed poll: auth alerts={n4}; "
+              f"subjects={[a['subject'] for a in smtp.replies('alert')]}")
+    assert counts == [1, 1, 1] and n4 == 2
+
+
+@legacy_only_skip
+def test_C9_reply_idempotent_half_done_message(imap, smtp, state_dir):
+    """CHANGE 9: 2nd attachment fails after the 1st reply was sent; the rerun sends 0 extra replies."""
+    ev_header("C9", "half-done message rerun: per-(Message-ID, attachment) reply ledger")
+    imap.add_message(make_message(subject="two atts", message_id="<half@example.invalid>",
+                                  attachments=[csv_attachment("h-a.csv"), csv_attachment("h-b.csv")]))
+    env = env_for(imap, smtp, state_dir)
+    run_cli(REPO, env, ["--once"], opts=["--fail-on", "h-b.csv"], name="C9")
+    after1 = len(smtp.replies())
+    rc, out, _ = run_cli(REPO, env, ["--once"], name="C9")
+    after2 = len(smtp.replies())
+    subj = [m["subject"] for m in smtp.replies()]
+    c = sqlite3.connect(os.path.join(state_dir, "ingest.db"))
+    reps = c.execute("SELECT key, att_index, reply_sent FROM replies ORDER BY key").fetchall()
+    led = c.execute("SELECT key, status, attempts, reply_sent FROM ledger").fetchall()
+    c.close()
+    extra = after2 - after1 - 1          # rerun should send exactly 1 (for h-b), 0 extra for h-a
+    ev("C9", f"replies after attempt1={after1} after rerun={after2} extra_duplicate_replies={extra}\n"
+             f"reply ledger={reps}\nmessage ledger={led}\nsubjects={subj}")
+    assert after1 == 1 and after2 == 2 and extra == 0
+    assert [r[1] for r in reps] == [0, 1] and led[0][1] == "done" and led[0][3] == 1
+
+
+def test_C_override_start_period_ge_deadline_plus_interval():
+    """compose override: healthcheck.start_period >= FFIS_POLL_DEADLINE_S + FFIS_WATCH_INTERVAL_S."""
+    ev_header("Cstart", "override start_period >= deadline + interval")
+    import yaml
+    doc = yaml.safe_load(open(os.path.join(REPO, "deploy/mdkappsvr/compose.ingest.override.yaml")))
+    svc = doc["services"]["ingest"]
+    env = svc["environment"]
+
+    def secs(v):
+        m = re.fullmatch(r"(\d+)(s|m)?", str(v))
+        return int(m.group(1)) * (60 if m.group(2) == "m" else 1)
+    sp = secs(svc["healthcheck"]["start_period"])
+    need = int(env["FFIS_POLL_DEADLINE_S"]) + int(env["FFIS_WATCH_INTERVAL_S"])
+    cmd_interval = None
+    ev("Cstart", f"start_period={sp}s deadline+interval={need}s healthcheck={svc['healthcheck']}")
+    assert sp >= need

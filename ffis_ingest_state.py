@@ -144,6 +144,7 @@ class Heartbeat:
             "last_ok_at": prev.get("last_ok_at"),
             "last_result": prev.get("last_result"),
             "found": prev.get("found", 0),
+            "consecutive_failures": int(prev.get("consecutive_failures") or 0),
             "pid": os.getpid(),
             "version": version,
         }
@@ -184,6 +185,9 @@ class Heartbeat:
             self.in_flight = False
             self.data["poll_finished_at"] = utcnow_iso()
             self.data["last_result"] = "ok" if ok else "error"
+            # resets on a successful poll, increments on any failed poll (survives restarts)
+            self.data["consecutive_failures"] = 0 if ok else int(
+                self.data.get("consecutive_failures") or 0) + 1
             self.stage = "idle"
             self._flush()
 
@@ -215,6 +219,13 @@ CREATE TABLE IF NOT EXISTS ledger (
     first_seen_at TEXT,
     done_at TEXT,
     reply_sent INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS replies (
+    key TEXT PRIMARY KEY,            -- '<message key>#<attachment index>'
+    message_key TEXT,
+    att_index INTEGER,
+    reply_sent INTEGER DEFAULT 1,
+    sent_at TEXT
 );
 """
 
@@ -322,6 +333,19 @@ class IngestState:
             raise
         return int(n)
 
+    # per-attachment reply ledger (reply idempotency)
+    def reply_already(self, message_key: str, att_index: int) -> bool:
+        r = self.conn.execute("SELECT reply_sent FROM replies WHERE key=?",
+                              (f"{message_key}#{int(att_index)}",)).fetchone()
+        return bool(r and r["reply_sent"])
+
+    def mark_reply(self, message_key: str, att_index: int) -> None:
+        """Called only after sendmail returned; autocommitted immediately (durable)."""
+        self.conn.execute(
+            "INSERT INTO replies(key, message_key, att_index, reply_sent, sent_at) "
+            "VALUES(?,?,?,1,?) ON CONFLICT(key) DO UPDATE SET reply_sent=1, sent_at=excluded.sent_at",
+            (f"{message_key}#{int(att_index)}", message_key, int(att_index), utcnow_iso()))
+
     def counts(self) -> Dict[str, int]:
         return {r["status"]: r["n"] for r in self.conn.execute(
             "SELECT status, COUNT(*) AS n FROM ledger GROUP BY status")}
@@ -347,10 +371,16 @@ def _smtp_settings() -> Dict[str, Any]:
 
 
 def send_alert(subject: str, lines: Dict[str, Any], *, sdir: Optional[str] = None,
-               rate_limit: bool = True, timeout: float = 15.0) -> str:
+               rate_limit: bool = True, timeout: float = 15.0,
+               dedupe_key: Optional[str] = None, dedupe_s: int = 3600) -> str:
     """
     Send a plain-text alert to FFIS_ALERT_TO. Never includes message contents
-    or credentials. Returns one of: 'sent', 'no_recipient', 'rate_limited', 'failed'.
+    or credentials. Returns one of: 'sent', 'no_recipient', 'rate_limited',
+    'deduped', 'failed'.
+
+    ``dedupe_key`` (e.g. "auth"): at most one alert per key per ``dedupe_s``
+    seconds, tracked as ``last_<key>_alert_at`` in stall.json. Keyed alerts are
+    independent of the general 30-min rate limit (pass rate_limit=False).
     Always logs a CRITICAL line first, so an unset recipient still leaves a trace.
     """
     body_lines = [f"{k}: {v}" for k, v in lines.items()]
@@ -362,6 +392,13 @@ def send_alert(subject: str, lines: Dict[str, Any], *, sdir: Optional[str] = Non
     sp = stall_path(sdir)
     st = read_json(sp) or {}
     now = time.time()
+    dkey = f"last_{dedupe_key}_alert_at" if dedupe_key else None
+    if dkey:
+        lastk = parse_iso(st.get(dkey))
+        if lastk is not None and now - lastk < dedupe_s:
+            log.warning("Alert '%s' deduped (last one %.0fs ago, window %ds).", dedupe_key,
+                        now - lastk, dedupe_s)
+            return "deduped"
     last = parse_iso(st.get("last_alert_at"))
     if rate_limit and last is not None and now - last < ALERT_MIN_GAP_S:
         log.warning("Alert rate-limited (last alert %.0fs ago).", now - last)
@@ -387,6 +424,9 @@ def send_alert(subject: str, lines: Dict[str, Any], *, sdir: Optional[str] = Non
         log.error("Alert send failed: %s", type(e).__name__)
         return "failed"
     st = read_json(sp) or {}
-    st["last_alert_at"] = utcnow_iso(now)
+    if dkey:
+        st[dkey] = utcnow_iso(now)
+    else:
+        st["last_alert_at"] = utcnow_iso(now)
     write_json_atomic(sp, st)
     return "sent"

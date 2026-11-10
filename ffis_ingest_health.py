@@ -6,8 +6,8 @@ Exit codes:
   0  heartbeat.json exists, now - poll_finished_at <= FFIS_HEALTH_MAX_AGE_S
      (default 2*interval + deadline = 540 s), and no poll in flight is older
      than FFIS_POLL_DEADLINE_S.
-  1  heartbeat missing, unreadable, stale, no finished poll yet, or a poll in
-     flight past the deadline.
+  1  heartbeat missing, unreadable, stale, no finished poll yet, a poll in
+     flight past the deadline, or consecutive_failures >= 3.
 
 Prints exactly one JSON line (ages and status only — never secrets).
 
@@ -24,6 +24,8 @@ import time
 from typing import Any, Dict, Optional, Tuple
 
 import ffis_ingest_state as st
+
+MAX_CONSECUTIVE_FAILURES = 3   # unhealthy at >= 3 failed polls in a row
 
 
 def _int_env(name: str, default: int) -> int:
@@ -72,6 +74,11 @@ def evaluate(now: Optional[float] = None, sdir: Optional[str] = None) -> Tuple[i
         return 1, out
     if now - finished > max_age:
         out.update(status="unhealthy", reason="heartbeat_stale")
+        return 1, out
+    fails = int(hb.get("consecutive_failures") or 0)
+    out["consecutive_failures"] = fails
+    if fails >= MAX_CONSECUTIVE_FAILURES:
+        out.update(status="unhealthy", reason="consecutive_failures")
         return 1, out
     out.update(status="healthy", reason="ok")
     return 0, out
