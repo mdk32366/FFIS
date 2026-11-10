@@ -566,6 +566,7 @@ This table documents every environment variable and its purpose:
 | `IMAP_PORT` | integer | `993` | IMAP port (993 for SSL, 143 for STARTTLS) |
 | `IMAP_USE_SSL` | boolean | `true` | Use SSL/TLS encryption |
 | `IMAP_FOLDER` | string | `INBOX` | Mailbox folder to scan |
+| `FFIS_WATCH_INTERVAL_S` | integer | `120` | Ingest health check's poll interval; keep equal to `--interval` (see `docs/CUTOVER-mdkappsvr.md`) |
 
 #### REST API (Data Export)
 

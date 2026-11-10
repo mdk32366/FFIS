@@ -1,17 +1,54 @@
-# T7 SANDBOX ONLY — a stand-in for the mdkappsvr compose `ingest` service as recorded
-# in SOURCE-MAP.md (profile ingest, restart unless-stopped, healthcheck disabled,
-# ONLY_UNSEEN/MARK_SEEN/REPLY env). Fake credentials only; no .env is read.
+# T7 SANDBOX ONLY — stand-in for mdkappsvr:/opt/apps/ffis-scrubber/compose.yaml.
+# Mirrors the REAL structure (read read-only 2026-11-10, redacted copy in the ffis-fix evidence
+# dir): project name, x-common anchor (image, env_file, restart, environment, mem_limit),
+# `app` + `ingest` services, ingest profile/command, `healthcheck: disable: true`, no volumes.
+# Differences: env values are fake/placeholders and env_file points at a FAKE file (real: .env).
+name: ffis-scrubber
+
+x-common: &common
+  image: ffis-scrubber:fly-v32
+  env_file: t7-fake.env               # real: .env (never read here)
+  restart: unless-stopped
+  environment:
+    API_REQUEST_TIMEOUT: "30"
+    FFIS_DEDUP_BACKEND: "none"
+    FFIS_EXPORT_BACKEND: "auto"
+    FFIS_EXPORT_GOOD: "false"
+    FFIS_EXPORT_IF_EXISTS: "append"
+    FFIS_PIPELINE_MARK_SEEN: "true"
+    FFIS_PIPELINE_ONLY_UNSEEN: "true"
+    FFIS_PIPELINE_REPLY: "true"
+    IMAP_FOLDER: "INBOX"
+    IMAP_HOST: "imap.example.invalid"
+    IMAP_PORT: "993"
+    IMAP_USE_SSL: "true"
+    SMTP_HOST: "smtp.example.invalid"
+    SMTP_PORT: "587"
+    STREAMLIT_LAYOUT: "wide"
+    STREAMLIT_PAGE_ICON: "x"
+    STREAMLIT_PAGE_TITLE: "FFIS"
+    STREAMLIT_SIDEBAR_STATE: "expanded"
+    UNDO_HISTORY_LIMIT: "20"
+  mem_limit: 2g
+
 services:
+  app:
+    <<: *common
+    command: ["python", "-m", "streamlit", "run", "flat_file_scrubber.py",
+              "--server.port=8501", "--server.address=0.0.0.0",
+              "--server.headless=true", "--browser.gatherUsageStats=false"]
+    ports:
+      - "127.0.0.1:8501:8501"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health',timeout=5).status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
   ingest:
-    image: ffis-scrubber:fly-v32
+    <<: *common
     profiles: ["ingest"]
     command: ["python", "ffis_email_pipeline.py", "--watch", "--interval", "120"]
-    restart: unless-stopped
-    environment:
-      FFIS_PIPELINE_ONLY_UNSEEN: "true"
-      FFIS_PIPELINE_MARK_SEEN: "true"
-      FFIS_PIPELINE_REPLY: "true"
-      FFIS_EXPORT_GOOD: "false"
-      IMAP_FOLDER: "INBOX"
     healthcheck:
       disable: true

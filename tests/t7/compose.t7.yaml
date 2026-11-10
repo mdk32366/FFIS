@@ -1,11 +1,14 @@
-# T7 SANDBOX ONLY (box Docker). Layered as:
-#   compose.base.yaml + ../../deploy/mdkappsvr/compose.ingest.override.yaml + compose.t7.yaml
-# * fakeimap sidecar has network_mode none; ingest shares ITS namespace -> loopback only,
-#   no route off the box ("--network none").
-# * Healthcheck timings and the poll deadline are SCALED DOWN so T7 fits in deadline+120 s.
-#   Phase A1 uses IMAP timeout 60 s > deadline 20 s (a hang the socket timeout does not catch);
-#   phase A2 uses the production ratio (timeout < deadline) to show the exit-71 path.
-# * /state is a box-local bind mount (overrides /opt/apps/... from the deploy override).
+# T7 SANDBOX ONLY (box Docker). Layered exactly like the server deploy:
+#   compose.base.yaml (stand-in for the real compose.yaml)
+#   + ../../deploy/mdkappsvr/compose.ingest.override.yaml
+#   + compose.t7.yaml (this file)
+# Started with `--profile ingest up -d fakeimap ingest` (the `app` service is never started).
+# * fakeimap sidecar has network_mode none; ingest shares ITS namespace -> loopback only.
+# * Fake credentials come from t7-fake.env via the anchor's env_file.
+# * Health timings / deadline are SCALED DOWN so T7 fits in deadline+120 s. start_period defaults
+#   to 1s (NOT 0s: compose treats 0s as unset and Docker inherits the image's 30s), which is
+#   deliberately BELOW the production rule start_period >= deadline+interval; phase A3 runs
+#   with the rule applied (T7_START_PERIOD=35s) to show its effect.
 services:
   fakeimap:
     image: ffis-scrubber:hardening-dev
@@ -27,12 +30,8 @@ services:
       IMAP_PORT: "1143"
       IMAP_USE_SSL: "false"
       FFIS_IMAP_STARTTLS: "false"
-      IMAP_USER: "ffis-fake-ingest@example.invalid"
-      IMAP_PASSWORD: "FAKE-imap-pw-7f3c9e1d-NOT-REAL"
       SMTP_HOST: "127.0.0.1"
       SMTP_PORT: "1"
-      SMTP_FROM_EMAIL: "ffis-fake-sender@example.invalid"
-      SMTP_APP_PASSWORD: "FAKE-smtp-pw-2b8d41aa-NOT-REAL"
       FFIS_PIPELINE_REPLY: "false"
       FFIS_DEDUP_BACKEND: "none"
       FFIS_INGEST_MODE: "${T7_MODE:-watermark}"
@@ -48,5 +47,5 @@ services:
       test: ["CMD", "python", "ffis_ingest_health.py"]
       interval: 2s
       timeout: 5s
-      start_period: 1s                         # NOT 0s: compose treats 0s as unset and Docker inherits the image HEALTHCHECK start-period (30s)
+      start_period: ${T7_START_PERIOD:-1s}
       retries: 2
