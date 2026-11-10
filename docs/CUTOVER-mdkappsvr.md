@@ -73,6 +73,7 @@ Applied via `deploy/mdkappsvr/compose.ingest.override.yaml` (repo only until Mat
 
 - **Exit codes:** 70 = poll exceeded deadline; 71 = no successful IMAP leg for the stall window. Docker `restart: unless-stopped` restarts on either. Docker does **not** restart a merely *unhealthy* container.
 - **Health:** `python ffis_ingest_health.py` -> exit 0/1 plus one JSON line (ages only). Unhealthy if the heartbeat is missing/stale, a poll is in flight past the deadline, or `consecutive_failures` >= 3 (resets on a good poll). Compose `start_period` is 420 s (>= deadline 300 + interval 120); a hang from container start therefore recovers by exit 70 before health can turn unhealthy.
+- **Startup hang:** health may sit in 'starting' during a startup hang, exit 70 still recovers. Exit 70 is the primary recovery; health is the secondary signal.
 - **Auth alert:** an IMAP LOGIN rejection sends one alert on the first failure, then at most one per hour (`last_auth_alert_at` in stall.json).
 - **Replies:** idempotent per (Message-ID, attachment index) via the `replies` table in ingest.db; a retried half-done message re-sends nothing already sent.
 - **\Seen:** in `watermark` mode `\Seen` is set only after the ledger commit and is no longer the source of truth; mail read by a human or the UI is still ingested. Poison messages are left unread.

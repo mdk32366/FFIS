@@ -568,6 +568,8 @@ This table documents every environment variable and its purpose:
 | `IMAP_FOLDER` | string | `INBOX` | Mailbox folder to scan |
 | `FFIS_WATCH_INTERVAL_S` | integer | `120` | Ingest health check's poll interval; keep equal to `--interval` (see `docs/CUTOVER-mdkappsvr.md`) |
 
+Email replies are at-least-once: a crash between sending a reply and recording it in the ledger can duplicate one reply.
+
 #### REST API (Data Export)
 
 | Variable | Type | Default | Description |
