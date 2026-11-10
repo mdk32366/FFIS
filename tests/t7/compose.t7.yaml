@@ -1,0 +1,52 @@
+# T7 SANDBOX ONLY (box Docker). Layered as:
+#   compose.base.yaml + ../../deploy/mdkappsvr/compose.ingest.override.yaml + compose.t7.yaml
+# * fakeimap sidecar has network_mode none; ingest shares ITS namespace -> loopback only,
+#   no route off the box ("--network none").
+# * Healthcheck timings and the poll deadline are SCALED DOWN so T7 fits in deadline+120 s.
+#   Phase A1 uses IMAP timeout 60 s > deadline 20 s (a hang the socket timeout does not catch);
+#   phase A2 uses the production ratio (timeout < deadline) to show the exit-71 path.
+# * /state is a box-local bind mount (overrides /opt/apps/... from the deploy override).
+services:
+  fakeimap:
+    image: ffis-scrubber:hardening-dev
+    network_mode: none
+    profiles: ["ingest"]
+    user: "1000:1000"
+    command: ["python", "/t7tests/fake_imap.py", "--host", "127.0.0.1", "--port", "1143",
+              "--mode", "${T7_FAKE_MODE:-blackhole}", "--seed", "${T7_FAKE_SEED:-0}"]
+    volumes:
+      - ../:/t7tests:ro
+    healthcheck:
+      disable: true
+  ingest:
+    network_mode: "service:fakeimap"
+    depends_on: [fakeimap]
+    command: ["python", "ffis_email_pipeline.py", "--watch", "--interval", "15"]
+    environment:
+      IMAP_HOST: "127.0.0.1"
+      IMAP_PORT: "1143"
+      IMAP_USE_SSL: "false"
+      FFIS_IMAP_STARTTLS: "false"
+      IMAP_USER: "ffis-fake-ingest@example.invalid"
+      IMAP_PASSWORD: "FAKE-imap-pw-7f3c9e1d-NOT-REAL"
+      SMTP_HOST: "127.0.0.1"
+      SMTP_PORT: "1"
+      SMTP_FROM_EMAIL: "ffis-fake-sender@example.invalid"
+      SMTP_APP_PASSWORD: "FAKE-smtp-pw-2b8d41aa-NOT-REAL"
+      FFIS_PIPELINE_REPLY: "false"
+      FFIS_DEDUP_BACKEND: "none"
+      FFIS_INGEST_MODE: "${T7_MODE:-watermark}"
+      FFIS_IMAP_TIMEOUT_S: "${T7_IMAP_TIMEOUT:-60}"
+      FFIS_POLL_DEADLINE_S: "20"
+      FFIS_STALL_CYCLES: "${T7_STALL_CYCLES:-4}"
+      FFIS_WATCH_INTERVAL_S: "15"
+      FFIS_HEALTH_MAX_AGE_S: "50"
+    volumes:
+      - ${T7_STATE_DIR:?set T7_STATE_DIR}:/state
+    healthcheck:
+      disable: false
+      test: ["CMD", "python", "ffis_ingest_health.py"]
+      interval: 2s
+      timeout: 5s
+      start_period: 1s                         # NOT 0s: compose treats 0s as unset and Docker inherits the image HEALTHCHECK start-period (30s)
+      retries: 2

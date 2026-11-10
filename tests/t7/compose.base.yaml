@@ -1,0 +1,17 @@
+# T7 SANDBOX ONLY — a stand-in for the mdkappsvr compose `ingest` service as recorded
+# in SOURCE-MAP.md (profile ingest, restart unless-stopped, healthcheck disabled,
+# ONLY_UNSEEN/MARK_SEEN/REPLY env). Fake credentials only; no .env is read.
+services:
+  ingest:
+    image: ffis-scrubber:fly-v32
+    profiles: ["ingest"]
+    command: ["python", "ffis_email_pipeline.py", "--watch", "--interval", "120"]
+    restart: unless-stopped
+    environment:
+      FFIS_PIPELINE_ONLY_UNSEEN: "true"
+      FFIS_PIPELINE_MARK_SEEN: "true"
+      FFIS_PIPELINE_REPLY: "true"
+      FFIS_EXPORT_GOOD: "false"
+      IMAP_FOLDER: "INBOX"
+    healthcheck:
+      disable: true
