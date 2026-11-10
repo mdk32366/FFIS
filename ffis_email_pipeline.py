@@ -68,7 +68,9 @@ import logging
 import os
 import re
 import smtplib
+import ssl
 import sys
+import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -151,6 +153,53 @@ except Exception:  # pragma: no cover
     _cfg_get_salesforce_config = None
 
 log = logging.getLogger("ffis.pipeline")
+
+# Ingest hardening (SPEC ffis-ingest-hardening@0.0): durable state, heartbeat,
+# alerts. Stdlib-only helper module that ships next to this file.
+try:
+    import ffis_ingest_state as _ist
+except Exception:  # pragma: no cover - module missing outside the repo
+    _ist = None
+
+
+def get_ingest_config() -> Dict[str, Any]:
+    """Hardening knobs (all env, safe defaults). See docs/CUTOVER-mdkappsvr.md."""
+    mode = getenv_str("FFIS_INGEST_MODE", "watermark").strip().lower() or "watermark"
+    if mode not in ("watermark", "legacy_unseen"):
+        log.warning("Unknown FFIS_INGEST_MODE=%r; using 'watermark'.", mode)
+        mode = "watermark"
+    return {
+        "mode": mode,
+        "imap_timeout_s": float(getenv_int("FFIS_IMAP_TIMEOUT_S", 30)),
+        "poll_deadline_s": float(getenv_int("FFIS_POLL_DEADLINE_S", 300)),
+        "smtp_timeout_s": float(getenv_int("FFIS_SMTP_TIMEOUT_S", 30)),
+        "stall_cycles": getenv_int("FFIS_STALL_CYCLES", 4),
+        "max_attempts": max(1, getenv_int("FFIS_MAX_ATTEMPTS", 3)),
+        "imap_starttls": getenv_bool("FFIS_IMAP_STARTTLS", True),
+    }
+
+
+# Current poll stage, for logs / stall.json:
+#   connect | login | select | search | fetch:<uid> | store | process:<uid> | reply:<uid> | logout
+_STAGE = {"stage": "idle"}
+_HEARTBEAT = None  # ffis_ingest_state.Heartbeat, created lazily
+
+
+def _set_stage(stage: str) -> None:
+    _STAGE["stage"] = stage
+    if _HEARTBEAT is not None:
+        _HEARTBEAT.set_stage(stage)
+
+
+def current_stage() -> str:
+    return _STAGE["stage"]
+
+
+def _get_heartbeat():
+    global _HEARTBEAT
+    if _HEARTBEAT is None and _ist is not None:
+        _HEARTBEAT = _ist.Heartbeat()
+    return _HEARTBEAT
 
 def get_allowed_senders() -> list[str]:
     """
@@ -524,6 +573,68 @@ def _decode_hdr(value: Optional[str]) -> str:
         return value
 
 
+def _imap_connect(host: str, port: int, use_ssl: bool, timeout: float,
+                  starttls: bool = True, ssl_context: Optional[ssl.SSLContext] = None):
+    """Open an IMAP connection whose socket has a timeout (SPEC section 1).
+
+    The timeout covers TCP connect, TLS handshake, greeting and every later
+    blocking recv/send (LOGIN, SELECT, SEARCH, FETCH, STORE, LOGOUT).
+    """
+    _set_stage("connect")
+    if use_ssl:
+        return imaplib.IMAP4_SSL(host, port, ssl_context=ssl_context, timeout=timeout)
+    M = imaplib.IMAP4(host, port, timeout=timeout)
+    if starttls:
+        M.starttls(ssl_context=ssl_context)
+    return M
+
+
+class IMAPAuthError(RuntimeError):
+    """IMAP LOGIN was rejected by the server (bad/rotated credential)."""
+
+
+def _imap_login(M, username: str, password: str) -> None:
+    _set_stage("login")
+    try:
+        M.login(username, password)
+    except imaplib.IMAP4.error as e:   # NO/BAD reply; never includes the password
+        raise IMAPAuthError(f"IMAP login rejected: {e}") from None
+
+
+def _imap_close(M, clean: bool) -> None:
+    """LOGOUT on a clean finish; on failure skip the round-trip and shut the socket."""
+    if M is None:
+        return
+    if clean:
+        _set_stage("logout")
+        try:
+            M.logout()
+            return
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        M.shutdown()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _extract_attachments(msg) -> List[Tuple[str, bytes]]:
+    """CSV/TXT attachment rule (unchanged from the original fetch loop)."""
+    atts: List[Tuple[str, bytes]] = []
+    for part in msg.walk():
+        ct = part.get_content_type()
+        fname = _decode_hdr(part.get_filename())
+        if fname and (
+            fname.lower().endswith((".csv", ".txt"))
+            or ct in ("text/csv", "text/plain", "application/octet-stream",
+                      "application/vnd.ms-excel")
+        ):
+            payload = part.get_payload(decode=True)
+            if payload:
+                atts.append((fname, payload))
+    return atts
+
+
 def fetch_inbound_messages(
     host: str,
     port: int,
@@ -534,6 +645,9 @@ def fetch_inbound_messages(
     subject_filter: str = "",
     only_unseen: bool = True,
     mark_seen: bool = True,
+    imap_timeout: Optional[float] = None,
+    starttls: Optional[bool] = None,
+    ssl_context: Optional[ssl.SSLContext] = None,
 ) -> List[InboundMessage]:
     """
     Connect to an IMAP mailbox and return one InboundMessage per email that
@@ -542,23 +656,28 @@ def fetch_inbound_messages(
     Unlike the UI's `fetch_csv_from_imap`, this captures the sender address,
     subject, and Message-ID so the pipeline can reply to the originator.
     """
+    icfg = get_ingest_config()
+    timeout = icfg["imap_timeout_s"] if imap_timeout is None else imap_timeout
+    use_starttls = icfg["imap_starttls"] if starttls is None else starttls
     results: List[InboundMessage] = []
     M = None
+    clean = False
     try:
-        M = imaplib.IMAP4_SSL(host, port) if use_ssl else imaplib.IMAP4(host, port)
-        if not use_ssl:
-            M.starttls()
-        M.login(username, password)
+        M = _imap_connect(host, port, use_ssl, timeout, use_starttls, ssl_context)
+        _imap_login(M, username, password)
+        _set_stage("select")
         M.select(folder)
 
         base = "UNSEEN" if only_unseen else "ALL"
         criterion = f'({base} SUBJECT "{subject_filter}")' if subject_filter.strip() else base
 
+        _set_stage("search")
         typ, data = M.search(None, criterion)
         if typ != "OK":
             raise RuntimeError(f"IMAP search failed: {typ}")
 
         for msg_id in data[0].split():
+            _set_stage(f"fetch:{msg_id.decode(errors='replace')}")
             # BODY.PEEK[] fetches the full message WITHOUT implicitly setting the
             # \Seen flag (plain RFC822/BODY[] would mark it read on fetch). This
             # keeps "unread" meaningful and lets mark_seen control seen status.
@@ -571,18 +690,7 @@ def fetch_inbound_messages(
             subject = _decode_hdr(msg.get("Subject", ""))
             mid = msg.get("Message-ID", "")
 
-            atts: List[Tuple[str, bytes]] = []
-            for part in msg.walk():
-                ct = part.get_content_type()
-                fname = _decode_hdr(part.get_filename())
-                if fname and (
-                    fname.lower().endswith((".csv", ".txt"))
-                    or ct in ("text/csv", "text/plain", "application/octet-stream",
-                              "application/vnd.ms-excel")
-                ):
-                    payload = part.get_payload(decode=True)
-                    if payload:
-                        atts.append((fname, payload))
+            atts = _extract_attachments(msg)
 
             if atts:
                 results.append(InboundMessage(
@@ -590,15 +698,16 @@ def fetch_inbound_messages(
                     message_id_header=mid, attachments=atts,
                 ))
                 if mark_seen:
+                    # legacy_unseen semantics (unchanged): \Seen before processing.
+                    _set_stage("store")
                     M.store(msg_id, "+FLAGS", "\\Seen")
+        clean = True
+    except IMAPAuthError as e:
+        raise IMAPAuthError(f"IMAP error at stage={current_stage()}: {e}") from None
     except Exception as e:  # noqa: BLE001
-        raise RuntimeError(f"IMAP error: {e}")
+        raise RuntimeError(f"IMAP error at stage={current_stage()}: {e}")
     finally:
-        if M is not None:
-            try:
-                M.logout()
-            except Exception:
-                pass
+        _imap_close(M, clean)
     return results
 
 
@@ -1438,7 +1547,8 @@ def send_results_email(to_addr: str, result: RoutingResult,
                         f"attachment; filename={stem}_{label}.csv")
         msg.attach(part)
 
-    with smtplib.SMTP(host, port) as server:
+    smtp_timeout = get_ingest_config()["smtp_timeout_s"]
+    with smtplib.SMTP(host, port, timeout=smtp_timeout) as server:
         server.starttls()
         server.login(user, pwd)
         server.sendmail(user, [a.strip() for a in to_addr.split(",")], msg.as_string())
@@ -1463,15 +1573,25 @@ def get_pipeline_config() -> Dict[str, Any]:
 
 
 def process_message(m: InboundMessage, dedup: DedupSource, cfg: Dict[str, Any],
-                    send: bool = True, exporter: Optional[Exporter] = None) -> List[RoutingResult]:
-    """Process every attachment in one inbound email; reply once per attachment."""
+                    send: bool = True, exporter: Optional[Exporter] = None,
+                    reply_status: Optional[List[bool]] = None,
+                    reply_guard: Optional[Any] = None) -> List[RoutingResult]:
+    """Process every attachment in one inbound email; reply once per attachment.
+
+    If ``reply_status`` is given, one bool per attempted reply is appended
+    (True only after ``sendmail`` returned).
+
+    ``reply_guard`` (watermark mode) makes replies idempotent per
+    (Message-ID, attachment index): ``already(idx)`` -> skip the send,
+    ``mark(idx)`` is called only after ``sendmail`` returned.
+    """
     out: List[RoutingResult] = []
     allow = get_allowed_senders()
     if not sender_allowed(m.sender, allow):
         log.warning("BLOCKED sender %s (not in FFIS_ALLOWED_SENDERS); skipping %d attachment(s).",
                     m.sender or "(empty)", len(m.attachments))
         return out
-    for fname, data in m.attachments:
+    for att_idx, (fname, data) in enumerate(m.attachments):
         try:
             df = read_csv_bytes(data, fname)
         except Exception as e:  # noqa: BLE001
@@ -1484,17 +1604,454 @@ def process_message(m: InboundMessage, dedup: DedupSource, cfg: Dict[str, Any],
         if exporter is not None and cfg.get("export_good", False):
             result.export_status = exporter.export(result.good, result.object_type)
             log.info("Export (%s) for %s: %s", exporter.name, fname, result.export_status)
-        if send and cfg.get("reply", True) and m.sender:
+        if send and cfg.get("reply", True) and m.sender and reply_guard is not None \
+                and reply_guard.already(att_idx):
+            log.info("Reply for %s (attachment #%d) already sent per ledger; not re-sending.",
+                     fname, att_idx)
+            if reply_status is not None:
+                reply_status.append(True)
+        elif send and cfg.get("reply", True) and m.sender:
+            _set_stage(f"reply:{m.msg_id.decode(errors='replace') if isinstance(m.msg_id, bytes) else m.msg_id}")
             try:
                 send_results_email(m.sender, result, in_reply_to=m.message_id_header)
+                if reply_guard is not None:
+                    reply_guard.mark(att_idx)
+                if reply_status is not None:
+                    reply_status.append(True)
             except Exception as e:  # noqa: BLE001
                 log.error("Failed to send reply to %s: %s", m.sender, e)
+                if reply_status is not None:
+                    reply_status.append(False)
         out.append(result)
     return out
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# INGEST HARDENING — UID watermark path (SPEC section 4)
+# ══════════════════════════════════════════════════════════════════════════
+_IMAP_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+_ATTACH_CTYPES = ("text/csv", "text/plain", "application/octet-stream",
+                  "application/vnd.ms-excel")
+
+
+def _imap_tokens(items) -> list:
+    """Parse an imaplib FETCH response (list of bytes / (meta, literal) tuples)
+    into nested Python lists. Literals become bytes; atoms/quoted become str."""
+    stream: list = []           # sequence of ("text", bytes) / ("lit", bytes)
+    for it in items:
+        if isinstance(it, tuple):
+            meta, lit = it[0], it[1]
+            meta = re.sub(rb"\{\d+\}$", b"", meta)
+            stream.append(("text", meta))
+            stream.append(("lit", lit))
+        elif isinstance(it, bytes):
+            stream.append(("text", it))
+    root: list = []
+    stack = [root]
+    for kind, chunk in stream:
+        if kind == "lit":
+            stack[-1].append(chunk)
+            continue
+        s = chunk.decode("utf-8", "replace")
+        i, n = 0, len(s)
+        while i < n:
+            c = s[i]
+            if c in " \r\n":
+                i += 1
+            elif c == "(":
+                new: list = []
+                stack[-1].append(new)
+                stack.append(new)
+                i += 1
+            elif c == ")":
+                if len(stack) > 1:
+                    stack.pop()
+                i += 1
+            elif c == '"':
+                j, buf = i + 1, []
+                while j < n and s[j] != '"':
+                    if s[j] == "\\" and j + 1 < n:
+                        j += 1
+                    buf.append(s[j])
+                    j += 1
+                stack[-1].append(buf and "".join(buf) or "")
+                i = j + 1
+            else:
+                j, depth = i, 0
+                while j < n and (depth > 0 or s[j] not in " ()\r\n"):
+                    if s[j] == "[":
+                        depth += 1
+                    elif s[j] == "]":
+                        depth -= 1
+                    j += 1
+                tok = s[i:j]
+                stack[-1].append(None if tok.upper() == "NIL" else tok)
+                i = j
+    return root
+
+
+def _fetch_pairs(items) -> Dict[str, Any]:
+    """{ 'UID': '12', 'INTERNALDATE': '...', 'BODYSTRUCTURE': [...], 'BODY[...]': b'...' }"""
+    toks = _imap_tokens(items)
+    # toks: [seq, 'FETCH'?, [k, v, k, v ...]] — imaplib strips the '* ' prefix
+    lst = next((t for t in toks if isinstance(t, list)), [])
+    out: Dict[str, Any] = {}
+    for k, v in zip(lst[0::2], lst[1::2]):
+        if isinstance(k, str):
+            key = k.upper()
+            if key.startswith("BODY["):
+                key = "BODY[" + key.split("[", 1)[1].split()[0].rstrip("]") + "]"
+            out[key] = v
+    return out
+
+
+def _bs_param(params, names) -> Optional[str]:
+    if not isinstance(params, list):
+        return None
+    for k, v in zip(params[0::2], params[1::2]):
+        if isinstance(k, str) and k.upper().rstrip("*") in names and isinstance(v, (str, bytes)):
+            return v.decode("utf-8", "replace") if isinstance(v, bytes) else v
+    return None
+
+
+def _bs_parts(bs) -> List[Tuple[str, Optional[str]]]:
+    """Flatten BODYSTRUCTURE into [(content_type, filename_or_None)]."""
+    out: List[Tuple[str, Optional[str]]] = []
+    if not isinstance(bs, list) or not bs:
+        return out
+    if isinstance(bs[0], list):                    # multipart
+        for p in bs:
+            if isinstance(p, list):
+                out.extend(_bs_parts(p))
+        return out
+    ctype = f"{str(bs[0] or '').lower()}/{str(bs[1] if len(bs) > 1 and bs[1] else '').lower()}"
+    fname = _bs_param(bs[2] if len(bs) > 2 else None, ("NAME",))
+    for ext in bs[7:]:                              # disposition: ("ATTACHMENT" ("FILENAME" "x"))
+        if (isinstance(ext, list) and len(ext) >= 2 and isinstance(ext[0], str)
+                and isinstance(ext[1], list)):
+            fn = _bs_param(ext[1], ("FILENAME",))
+            if fn:
+                fname = fn
+        if ctype == "message/rfc822" and isinstance(ext, list) and ext and isinstance(ext[0], (list, str)):
+            pass
+    out.append((ctype, _decode_hdr(fname) if fname else None))
+    return out
+
+
+def bodystructure_has_attachment(bs) -> bool:
+    """BODYSTRUCTURE pre-check mirroring _extract_attachments' rule."""
+    for ctype, fname in _bs_parts(bs):
+        if fname and (fname.lower().endswith((".csv", ".txt")) or ctype in _ATTACH_CTYPES):
+            return True
+    return False
+
+
+def _internaldate_iso(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    try:
+        from datetime import datetime, timezone
+        dt = datetime.strptime(value.strip(), "%d-%b-%Y %H:%M:%S %z")
+        return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (TypeError, ValueError):
+        return None
+
+
+def _since_criterion(iso: str, days_back: int = 2) -> str:
+    from datetime import datetime, timedelta
+    d = datetime.strptime(iso[:10], "%Y-%m-%d") - timedelta(days=days_back)
+    return f"SINCE {d.day:02d}-{_IMAP_MONTHS[d.month - 1]}-{d.year}"
+
+
+def _uid_search(M, criterion: str) -> List[int]:
+    _set_stage("search")
+    typ, data = M.uid("SEARCH", None, criterion)
+    if typ != "OK":
+        raise RuntimeError(f"IMAP UID SEARCH failed: {typ}")
+    return sorted({int(x) for x in (data[0] or b"").split() if x.isdigit()})
+
+
+def _select_info(M, folder: str) -> Tuple[int, Optional[int]]:
+    _set_stage("select")
+    typ, _ = M.select(folder)
+    if typ != "OK":
+        raise RuntimeError(f"IMAP SELECT {folder} failed: {typ}")
+    _, v = M.response("UIDVALIDITY")
+    _, nx = M.response("UIDNEXT")
+    if not v or v[0] is None:
+        raise RuntimeError("IMAP server did not return UIDVALIDITY")
+    uidnext = int(nx[0]) if nx and nx[0] is not None else None
+    return int(v[0]), uidnext
+
+
+def poll_watermark(M, folder: str, state, cfg: Dict[str, Any], dedup: DedupSource,
+                   exporter: Optional[Exporter], send: bool, max_attempts: int) -> Dict[str, int]:
+    """One watermark poll over an already-logged-in IMAP connection.
+
+    Advances the watermark only after a durable ledger commit; sets \\Seen only
+    after that commit (if MARK_SEEN). Processing failures stop the advance for
+    this poll; after ``max_attempts`` the message becomes ``poison`` (alert) and
+    the watermark moves on. IMAP/socket errors propagate to the caller.
+    """
+    uidvalidity, uidnext = _select_info(M, folder)
+    wm = state.get_watermark(folder)
+    resync = wm is None or wm[0] != uidvalidity
+    subj = cfg.get("subject_filter", "").strip()
+    subj_crit = f' SUBJECT "{subj}"' if subj else ""
+    if resync:
+        last_iso = state.last_done_internaldate()
+        base = _since_criterion(last_iso) if last_iso else "UNSEEN"
+        log.warning("Watermark resync for %s (stored uidvalidity=%s, server=%s): UID SEARCH %s.",
+                    folder, wm[0] if wm else None, uidvalidity, base)
+        uids = _uid_search(M, base + subj_crit)
+        last_uid = 0
+    else:
+        last_uid = wm[1]
+        uids = [u for u in _uid_search(M, f"UID {last_uid + 1}:*{subj_crit}") if u > last_uid]
+    stats = {"new": len(uids), "with_attachments": 0, "done": 0, "skipped": 0,
+             "failed": 0, "poison": 0}
+    stopped = False
+    for uid in uids:
+        outcome = _handle_uid(M, folder, uid, uidvalidity, state, cfg, dedup, exporter, send,
+                              max_attempts, advance=not resync, stats=stats)
+        if outcome == "stop":
+            stopped = True
+            break
+    if resync and not stopped:
+        top = (uidnext - 1) if uidnext else max(uids or [0])
+        if not uidnext:
+            allu = _uid_search(M, "ALL")
+            top = max(allu or [0])
+        state.set_watermark(folder, uidvalidity, max(top, max(uids or [0])))
+        log.info("Watermark rebased: %s uidvalidity=%s last_uid=%s.", folder, uidvalidity,
+                 max(top, max(uids or [0])))
+    return stats
+
+
+def _handle_uid(M, folder, uid, uidvalidity, state, cfg, dedup, exporter, send,
+                max_attempts, advance, stats) -> str:
+    _set_stage(f"fetch:{uid}")
+    typ, data = M.uid("FETCH", str(uid),
+                      "(UID INTERNALDATE BODYSTRUCTURE BODY.PEEK[HEADER.FIELDS (MESSAGE-ID FROM SUBJECT)])")
+    if typ != "OK":
+        raise RuntimeError(f"IMAP UID FETCH {uid} failed: {typ}")
+    if not data or data == [None]:
+        log.info("UID %s vanished before fetch; skipping.", uid)
+        return "advance"
+    f = _fetch_pairs(data)
+    hdr_raw = f.get("BODY[HEADER.FIELDS]") or b""
+    if isinstance(hdr_raw, str):
+        hdr_raw = hdr_raw.encode()
+    hdr = email_lib.message_from_bytes(hdr_raw) if hdr_raw else email_lib.message.Message()
+    mid = (hdr.get("Message-ID") or "").strip()
+    sender = parseaddr(hdr.get("From", ""))[1].strip().lower()
+    subject = _decode_hdr(hdr.get("Subject", ""))
+    idate = _internaldate_iso(f.get("INTERNALDATE"))
+    key = mid or f"{uidvalidity}:{uid}"
+    common = dict(key=key, folder=folder, uidvalidity=uidvalidity, uid=uid,
+                  message_id=mid, internaldate=idate)
+
+    entry = state.get_entry(key)
+    if entry is not None and entry["status"] in _ist.TERMINAL_STATUSES:
+        log.info("UID %s already %s in ledger (key dedup); not reprocessing.", uid, entry["status"])
+        stats["skipped"] += 1
+        if advance:
+            wm = state.get_watermark(folder)
+            if wm is None or wm[1] < uid:
+                state.set_watermark(folder, uidvalidity, uid)
+        return "advance"
+
+    if not bodystructure_has_attachment(f.get("BODYSTRUCTURE")):
+        state.commit_terminal(status="skipped_no_attachment", advance=advance, **common)
+        stats["skipped"] += 1
+        return "advance"
+
+    stats["with_attachments"] += 1
+    if not sender_allowed(sender, get_allowed_senders()):
+        log.warning("BLOCKED sender %s (not in FFIS_ALLOWED_SENDERS); UID %s.", sender or "(empty)", uid)
+        state.commit_terminal(status="blocked_sender", advance=advance, **common)
+        if cfg.get("mark_seen", True):
+            _set_stage("store")
+            M.uid("STORE", str(uid), "+FLAGS", "(\\Seen)")
+        stats["skipped"] += 1
+        return "advance"
+
+    _set_stage(f"fetch:{uid}")
+    typ2, raw = M.uid("FETCH", str(uid), "(BODY.PEEK[])")
+    if typ2 != "OK":
+        raise RuntimeError(f"IMAP UID FETCH {uid} body failed: {typ2}")
+    body = _fetch_pairs(raw).get("BODY[]") if raw else None
+    if isinstance(body, str):
+        body = body.encode()
+    msg = email_lib.message_from_bytes(body or b"")
+    atts = _extract_attachments(msg)
+    if not atts:
+        state.commit_terminal(status="skipped_no_attachment", advance=advance, **common)
+        stats["skipped"] += 1
+        return "advance"
+    m = InboundMessage(msg_id=str(uid).encode(), sender=sender, subject=subject,
+                       message_id_header=msg.get("Message-ID", "") or mid, attachments=atts)
+    _set_stage(f"process:{uid}")
+    replies: List[bool] = []
+    try:
+        process_message(m, dedup, cfg, send=send, exporter=exporter, reply_status=replies,
+                        reply_guard=_ReplyGuard(state, key))
+    except Exception as e:  # noqa: BLE001
+        attempts = state.record_failure(key=key, uidvalidity=uidvalidity, uid=uid,
+                                        message_id=mid, internaldate=idate)
+        if attempts >= max_attempts:
+            state.commit_terminal(status="poison", advance=advance, **common)
+            stats["poison"] += 1
+            log.critical("POISON: UID %s failed %d time(s) (%s); marked poison, advancing.",
+                         uid, attempts, type(e).__name__)
+            _ist.send_alert("poison message", {"uid": uid, "uidvalidity": uidvalidity,
+                                               "attempts": attempts, "error": type(e).__name__,
+                                               "stage": f"process:{uid}"})
+            return "advance"
+        stats["failed"] += 1
+        log.error("Processing UID %s failed (attempt %d/%d): %s. Not advancing this poll.",
+                  uid, attempts, max_attempts, e)
+        return "stop"
+    reply_sent = 1 if replies and all(replies) else 0
+    state.commit_terminal(status="done", reply_sent=reply_sent, advance=advance, **common)
+    stats["done"] += 1
+    if cfg.get("mark_seen", True):
+        # Only AFTER the durable commit. \Seen is no longer the source of truth.
+        _set_stage("store")
+        M.uid("STORE", str(uid), "+FLAGS", "(\\Seen)")
+    return "advance"
+
+
+class _ReplyGuard:
+    """Reply idempotency for one message: ledger key (Message-ID, attachment index)."""
+
+    def __init__(self, state, message_key: str):
+        self.state, self.key = state, message_key
+
+    def already(self, idx: int) -> bool:
+        return self.state.reply_already(self.key, idx)
+
+    def mark(self, idx: int) -> None:
+        self.state.mark_reply(self.key, idx)
+
+
+def fetch_and_process_watermark(imap: Dict[str, Any], user: str, pwd: str, cfg: Dict[str, Any],
+                                dedup: DedupSource, exporter: Optional[Exporter], send: bool,
+                                icfg: Dict[str, Any], state=None) -> Dict[str, int]:
+    own_state = state is None
+    if own_state:
+        state = _ist.IngestState()
+    M = None
+    clean = False
+    try:
+        try:
+            M = _imap_connect(imap["host"], imap["port"], imap["use_ssl"],
+                              icfg["imap_timeout_s"], icfg["imap_starttls"])
+            _imap_login(M, user, pwd)
+            stats = poll_watermark(M, imap["folder"], state, cfg, dedup, exporter, send,
+                                   icfg["max_attempts"])
+            clean = True
+        except IMAPAuthError as e:
+            raise IMAPAuthError(f"IMAP error at stage={current_stage()}: {e}") from None
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f"IMAP error at stage={current_stage()}: {e}")
+        finally:
+            _imap_close(M, clean)
+    finally:
+        if own_state:
+            state.close()
+    return stats
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# INGEST HARDENING — stall watchdog (SPEC section 2)
+# ══════════════════════════════════════════════════════════════════════════
+class StallWatchdog(threading.Thread):
+    """Daemon thread. Every ``tick`` s:
+    * poll in flight longer than ``deadline`` -> CRITICAL, stall.json, alert, os._exit(70)
+    * no successful IMAP leg for ``cycles * (interval + deadline)`` -> same, exit 71.
+      The reference time is max(last_ok_at, process start) so a freshly
+      restarted process always gets one full window (no crash loop on a
+      stale heartbeat from the previous container).
+    """
+
+    def __init__(self, hb, deadline: float, interval: Optional[float], cycles: int,
+                 tick: float = 10.0, exit_fn=None):
+        super().__init__(daemon=True, name="ffis-stall-watchdog")
+        self.hb, self.deadline, self.interval = hb, deadline, interval
+        self.cycles, self.tick = cycles, tick
+        self.exit_fn = exit_fn or os._exit
+
+    def run(self) -> None:
+        while True:
+            time.sleep(self.tick)
+            try:
+                self.check()
+            except SystemExit:
+                raise
+            except Exception as e:  # noqa: BLE001
+                log.error("Watchdog check error: %s", e)
+
+    def check(self, now: Optional[float] = None) -> None:
+        now = time.time() if now is None else now
+        in_flight, started, last_ok, stage = self.hb.snapshot()
+        if in_flight and started is not None and now - started > self.deadline:
+            self.trip(70, "STALL: poll exceeded deadline", stage, now, started, last_ok)
+            return
+        if self.interval is not None and self.cycles > 0:
+            ref = max(last_ok or 0.0, self.hb.process_started_at)
+            limit = self.cycles * (self.interval + self.deadline)
+            if now - ref > limit:
+                self.trip(71, f"STALL: no successful IMAP poll for >{limit:.0f}s",
+                          stage, now, started, last_ok)
+
+    def trip(self, code: int, reason: str, stage: str, now: float,
+             started: Optional[float], last_ok: Optional[float]) -> None:
+        poll_age = round(now - started, 1) if started else None
+        ok_age = round(now - last_ok, 1) if last_ok else None
+        log.critical("%s (stage=%s, poll_age_s=%s, last_ok_age_s=%s, exit=%d)",
+                     reason, stage, poll_age, ok_age, code)
+        sp = _ist.stall_path(self.hb.dir)
+        st = _ist.read_json(sp) or {}
+        st.update({"stalled_at": _ist.utcnow_iso(now), "exit_code": code, "reason": reason,
+                   "stage": stage, "poll_age_s": poll_age, "last_ok_age_s": ok_age,
+                   "pid": os.getpid(), "recovered_at": None})
+        _ist.write_json_atomic(sp, st)
+        t = threading.Thread(target=_ist.send_alert, daemon=True,
+                             args=(f"ingest stall (exit {code})",
+                                   {"reason": reason, "stage": stage, "poll_age_s": poll_age,
+                                    "last_ok_age_s": ok_age, "exit_code": code}),
+                             kwargs={"sdir": self.hb.dir})
+        t.start()
+        t.join(15)
+        for h in logging.getLogger().handlers:
+            try:
+                h.flush()
+            except Exception:  # noqa: BLE001
+                pass
+        self.exit_fn(code)
+
+
+def _maybe_send_recovered(hb) -> None:
+    sp = _ist.stall_path(hb.dir)
+    st = _ist.read_json(sp)
+    if not st or not st.get("stalled_at") or st.get("recovered_at"):
+        return
+    stalled = _ist.parse_iso(st.get("stalled_at"))
+    dur = round(time.time() - stalled, 1) if stalled else None
+    st["recovered_at"] = _ist.utcnow_iso()
+    _ist.write_json_atomic(sp, st)
+    log.warning("Recovered after stall (exit %s, %ss ago).", st.get("exit_code"), dur)
+    _ist.send_alert("ingest recovered", {"stall_duration_s": dur,
+                                         "previous_exit_code": st.get("exit_code"),
+                                         "previous_stage": st.get("stage")},
+                    sdir=hb.dir, rate_limit=False)
+
+
 def run_once(send: bool = True) -> List[RoutingResult]:
     cfg = get_pipeline_config()
+    icfg = get_ingest_config()
     imap = get_imap_config()
     user = getenv_str("IMAP_USER", getenv_str("SMTP_FROM_EMAIL", ""))
     pwd = getenv_str("IMAP_PASSWORD", getenv_str("SMTP_APP_PASSWORD", ""))
@@ -1503,31 +2060,89 @@ def run_once(send: bool = True) -> List[RoutingResult]:
     dedup = make_dedup_source(cfg["dedup_backend"], cfg["reference_dir"])
     exporter = make_exporter(cfg["export_backend"], cfg["export_if_exists"]) \
         if cfg["export_good"] else NoneExporter()
-    log.info("Polling %s as %s (dedup: %s, export: %s%s).",
+    log.info("Polling %s as %s (dedup: %s, export: %s%s, mode: %s).",
              imap["host"], user, dedup.name,
              exporter.name if cfg["export_good"] else "off",
-             "" if cfg["export_good"] else " (FFIS_EXPORT_GOOD=false)")
+             "" if cfg["export_good"] else " (FFIS_EXPORT_GOOD=false)", icfg["mode"])
+    hb = _get_heartbeat()
+    if icfg["mode"] == "watermark" and _ist is not None:
+        stats = fetch_and_process_watermark(imap, user, pwd, cfg, dedup, exporter, send, icfg)
+        if hb is not None:
+            hb.imap_ok(stats["with_attachments"])
+        log.info("Found %d message(s) with attachments. (watermark: %d new uid(s), %d done, "
+                 "%d skipped, %d failed, %d poison)", stats["with_attachments"], stats["new"],
+                 stats["done"], stats["skipped"], stats["failed"], stats["poison"])
+        return []
     messages = fetch_inbound_messages(
         host=imap["host"], port=imap["port"], use_ssl=imap["use_ssl"],
         username=user, password=pwd, folder=imap["folder"],
         subject_filter=cfg["subject_filter"], only_unseen=cfg["only_unseen"],
         mark_seen=cfg["mark_seen"],
     )
+    if hb is not None:
+        hb.imap_ok(len(messages))
     log.info("Found %d message(s) with attachments.", len(messages))
     results: List[RoutingResult] = []
     for m in messages:
+        _set_stage(f"process:{m.msg_id.decode(errors='replace')}")
         results.extend(process_message(m, dedup, cfg, send=send, exporter=exporter))
     return results
 
 
-def run_watch(interval: int = 120, send: bool = True) -> None:
-    log.info("Watching inbox every %ds. Ctrl-C to stop.", interval)
-    while True:
+def run_poll(send: bool = True) -> bool:
+    """One heartbeat-wrapped poll. Returns True on success. Never raises."""
+    hb = _get_heartbeat()
+    if hb is not None:
+        hb.poll_start()
+    ok = False
+    try:
+        run_once(send=send)
+        ok = True
+    except IMAPAuthError as e:
+        log.error("Poll cycle failed: %s", e)
+        if _ist is not None:
+            # first auth failure alerts immediately; then at most once per hour
+            _ist.send_alert("IMAP authentication failed",
+                            {"stage": "login", "error": "AUTHENTICATIONFAILED/NO from server",
+                             "consecutive_failures": (hb.data.get("consecutive_failures", 0) + 1)
+                             if hb is not None else "?"},
+                            sdir=hb.dir if hb is not None else None,
+                            rate_limit=False, dedupe_key="auth", dedupe_s=3600)
+    except Exception as e:  # noqa: BLE001
+        log.error("Poll cycle failed: %s", e)
+    finally:
+        if hb is not None:
+            hb.poll_finish(ok)
+    if ok and hb is not None:
         try:
-            run_once(send=send)
+            _maybe_send_recovered(hb)
         except Exception as e:  # noqa: BLE001
-            log.error("Poll cycle failed: %s", e)
-        time.sleep(max(15, interval))
+            log.error("Recovered-alert check failed: %s", e)
+    return ok
+
+
+def start_watchdog(interval: Optional[float]) -> Optional["StallWatchdog"]:
+    hb = _get_heartbeat()
+    if hb is None:
+        return None
+    icfg = get_ingest_config()
+    wd = StallWatchdog(hb, deadline=icfg["poll_deadline_s"], interval=interval,
+                       cycles=icfg["stall_cycles"])
+    wd.start()
+    return wd
+
+
+def run_watch(interval: int = 120, send: bool = True) -> None:
+    icfg = get_ingest_config()
+    sleep_s = max(15, interval)
+    log.info("Watching inbox every %ds. Ctrl-C to stop. (mode=%s, imap_timeout=%ss, "
+             "poll_deadline=%ss, smtp_timeout=%ss, stall_cycles=%s)", interval, icfg["mode"],
+             icfg["imap_timeout_s"], icfg["poll_deadline_s"], icfg["smtp_timeout_s"],
+             icfg["stall_cycles"])
+    start_watchdog(float(sleep_s))
+    while True:
+        run_poll(send=send)
+        time.sleep(sleep_s)
 
 
 def process_local_file(path: str) -> RoutingResult:
@@ -1594,8 +2209,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         process_local_file(args.file)
         return 0
     if args.once:
-        run_once(send=not args.no_send)
-        return 0
+        start_watchdog(None)          # poll deadline only
+        return 0 if run_poll(send=not args.no_send) else 1
     if args.watch:
         run_watch(interval=args.interval, send=not args.no_send)
         return 0

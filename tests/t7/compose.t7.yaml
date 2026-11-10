@@ -1,0 +1,51 @@
+# T7 SANDBOX ONLY (box Docker). Layered exactly like the server deploy:
+#   compose.base.yaml (stand-in for the real compose.yaml)
+#   + ../../deploy/mdkappsvr/compose.ingest.override.yaml
+#   + compose.t7.yaml (this file)
+# Started with `--profile ingest up -d fakeimap ingest` (the `app` service is never started).
+# * fakeimap sidecar has network_mode none; ingest shares ITS namespace -> loopback only.
+# * Fake credentials come from t7-fake.env via the anchor's env_file.
+# * Health timings / deadline are SCALED DOWN so T7 fits in deadline+120 s. start_period defaults
+#   to 1s (NOT 0s: compose treats 0s as unset and Docker inherits the image's 30s), which is
+#   deliberately BELOW the production rule start_period >= deadline+interval; phase A3 runs
+#   with the rule applied (T7_START_PERIOD=35s) to show its effect.
+services:
+  fakeimap:
+    image: ffis-scrubber:hardening-dev
+    network_mode: none
+    profiles: ["ingest"]
+    user: "1000:1000"
+    command: ["python", "/t7tests/fake_imap.py", "--host", "127.0.0.1", "--port", "1143",
+              "--mode", "${T7_FAKE_MODE:-blackhole}", "--seed", "${T7_FAKE_SEED:-0}"]
+    volumes:
+      - ../:/t7tests:ro
+    healthcheck:
+      disable: true
+  ingest:
+    network_mode: "service:fakeimap"
+    depends_on: [fakeimap]
+    command: ["python", "ffis_email_pipeline.py", "--watch", "--interval", "15"]
+    environment:
+      IMAP_HOST: "127.0.0.1"
+      IMAP_PORT: "1143"
+      IMAP_USE_SSL: "false"
+      FFIS_IMAP_STARTTLS: "false"
+      SMTP_HOST: "127.0.0.1"
+      SMTP_PORT: "1"
+      FFIS_PIPELINE_REPLY: "false"
+      FFIS_DEDUP_BACKEND: "none"
+      FFIS_INGEST_MODE: "${T7_MODE:-watermark}"
+      FFIS_IMAP_TIMEOUT_S: "${T7_IMAP_TIMEOUT:-60}"
+      FFIS_POLL_DEADLINE_S: "20"
+      FFIS_STALL_CYCLES: "${T7_STALL_CYCLES:-4}"
+      FFIS_WATCH_INTERVAL_S: "15"
+      FFIS_HEALTH_MAX_AGE_S: "50"
+    volumes:
+      - ${T7_STATE_DIR:?set T7_STATE_DIR}:/state
+    healthcheck:
+      disable: false
+      test: ["CMD", "python", "ffis_ingest_health.py"]
+      interval: 2s
+      timeout: 5s
+      start_period: ${T7_START_PERIOD:-1s}
+      retries: 2

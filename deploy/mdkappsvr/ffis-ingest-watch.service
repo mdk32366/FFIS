@@ -1,0 +1,11 @@
+# Phase 2 host check (SPEC section 5.2). NOT INSTALLED — needs Matt's GO.
+# Install: /etc/systemd/system/ffis-ingest-watch.service + .timer,
+#          /usr/local/bin/ffis-ingest-watch.sh, then `systemctl enable --now ffis-ingest-watch.timer`.
+[Unit]
+Description=FFIS ingest health watch (docker inspect + heartbeat)
+After=docker.service
+OnFailure=ffis-ingest-watch-failed@%n.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/ffis-ingest-watch.sh
