@@ -1,0 +1,35 @@
+# ffis-ingest-hardening@0.0 — compose override for the mdkappsvr `ingest` service.
+#
+# LIVES IN THE REPO ONLY. NOT APPLIED. Applying it is a server deploy and a
+# RESTART of the live ingest: it needs Matt's explicit GO (see docs/CUTOVER-mdkappsvr.md).
+#
+#   cd /opt/apps/ffis-scrubber
+#   install -d -o 1000 -g 1000 -m 0700 /opt/apps/ffis-scrubber/state
+#   docker compose -f compose.yaml -f compose.ingest.override.yaml --profile ingest up -d ingest
+#
+# Merges onto the existing `ingest` service (profile `ingest`, command
+# `python ffis_email_pipeline.py --watch --interval 120`, env from .env).
+services:
+  ingest:
+    image: ffis-scrubber:hardening-dev        # pin to the GO'd tag/digest at deploy time
+    restart: unless-stopped                   # recovery = watchdog exit 70/71 -> Docker restart
+    environment:
+      FFIS_INGEST_MODE: "watermark"           # rollback: "legacy_unseen"
+      FFIS_STATE_DIR: "/state"
+      FFIS_IMAP_TIMEOUT_S: "30"
+      FFIS_POLL_DEADLINE_S: "300"
+      FFIS_SMTP_TIMEOUT_S: "30"
+      FFIS_STALL_CYCLES: "4"
+      FFIS_MAX_ATTEMPTS: "3"
+      FFIS_WATCH_INTERVAL_S: "120"            # keep equal to --interval; used by the health check
+      FFIS_HEALTH_MAX_AGE_S: "540"            # 2*interval + deadline
+      # FFIS_ALERT_TO: ""                     # Matt decision (SPEC section 5). Unset = CRITICAL log + stall.json only.
+    volumes:
+      - /opt/apps/ffis-scrubber/state:/state  # uid 1000, mode 0700, inside the LUKS volume
+    healthcheck:                              # replaces `disable: true` and the image's :8501 probe
+      disable: false
+      test: ["CMD", "python", "ffis_ingest_health.py"]
+      interval: 60s
+      timeout: 10s
+      start_period: 360s                      # first poll + deadline
+      retries: 3

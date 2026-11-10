@@ -1,0 +1,11 @@
+# Phase 2 host check timer (every 5 min). NOT INSTALLED — needs Matt's GO.
+[Unit]
+Description=Run ffis-ingest-watch every 5 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+Unit=ffis-ingest-watch.service
+
+[Install]
+WantedBy=timers.target
