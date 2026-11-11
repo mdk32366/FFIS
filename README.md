@@ -91,6 +91,8 @@ python -m streamlit run flat_file_scrubber.py  # Universal
 
 The application will open at `http://localhost:8501`.
 
+Sign-in locks after repeated wrong passwords. After a successful sign-in, reloading the page keeps you signed in.
+
 ---
 
 ## ⏱️ Time Efficiency: Manual Excel vs. FFIS
