@@ -18,6 +18,12 @@ import imaplib
 import email as email_lib
 import requests
 import streamlit_authenticator as stauth
+from ffis_login import (
+    LOCKOUT_MESSAGE,
+    LOGIN_LOCKED_KEY,
+    emit_pending_login_cookie,
+    install_login_hardening,
+)
 from ffis_worker_status import render_worker_status
 from ffis_worker_status import render_worker_status_compact
 from datetime import datetime
@@ -132,7 +138,19 @@ authenticator = stauth.Authenticate(
     cookie_expiry_days=_auth_cfg["cookie"]["expiry_days"],
 )
 
+# Cap failed guesses and set the session cookie from the app (HttpOnly, Secure).
+# SameSite and FFIS_LOGIN_MAX_FAILURES: docs/CUTOVER-mdkappsvr.md
+install_login_hardening(authenticator)
+
+if st.session_state.get(LOGIN_LOCKED_KEY):
+    st.error(LOCKOUT_MESSAGE)
+    st.stop()
+
 authenticator.login()
+emit_pending_login_cookie()
+
+if st.session_state.get(LOGIN_LOCKED_KEY):
+    st.rerun()
 
 if st.session_state.get("authentication_status") is False:
     st.error("Incorrect username or password.")

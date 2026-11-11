@@ -79,3 +79,33 @@ Applied via `deploy/mdkappsvr/compose.ingest.override.yaml` (repo only until Mat
 - **\Seen:** in `watermark` mode `\Seen` is set only after the ledger commit and is no longer the source of truth; mail read by a human or the UI is still ingested. Poison messages are left unread.
 - **Reply crash window:** at most one duplicate reply is possible if the process dies between `sendmail` and the reply-ledger write (accepted; exactly-once over SMTP is not achievable). A failed reply is logged and the message is still `done` with `reply_sent=0`.
 - **First start / UIDVALIDITY change:** resync via `UID SEARCH UNSEEN` (first ever) or `SINCE <last done - 2 days>`; the ledger dedups by Message-ID; the watermark is rebased to UIDNEXT-1 only after the whole resync batch commits.
+
+## Login hardening (repo only until a later app restart)
+
+Not deployed with this change. Does not change ingest, alerts, or `ingest.db`. Restarting the **app** process is what clears the in-memory failure counts; leave ingest alone.
+
+| Env knob | Default | Meaning |
+|---|---|---|
+| `FFIS_LOGIN_MAX_FAILURES` | 5 | Failed password attempts per username before further tries are refused and the password is not checked. Missing, non-integer, or `< 1` stays at 5 so a typo cannot disable the cap. Unknown usernames count too. A successful password login clears that username. Cookie re-login (reload) is not a guess and is not blocked. |
+
+### Session cookie flags and SameSite
+
+streamlit-authenticator 0.4.x (the version `requirements.txt` resolves next to Streamlit 1.59) still creates the bcrypt check and the JWT (`username` + `exp_date`, signed with the cookie key). On the next load it reads that JWT from `st.context.cookies`, which is the request Cookie header, so a real HttpOnly cookie still restores the session. It **writes** the JWT through CookieManager (`document.cookie`). Browsers drop HttpOnly on that path, and Caddy cannot turn a JavaScript cookie into an HttpOnly one. CookieManager can set Secure and SameSite `lax` or `strict` (not `none`).
+
+The app therefore does not use CookieManager to write `ffis_auth`. After a successful login or a logout, a same-origin component iframe POSTs a one-time nonce to `/ffis/login-cookie`. The Starlette route on the Streamlit 1.59 server responds with `Set-Cookie`. The client does not choose the cookie value. Flags on that header:
+
+- **Secure** and **HttpOnly** are always set. The live site is HTTPS in front of Caddy (`https://mdkappsvr.tailea9f4f.ts.net:8443`); a plain-HTTP browser drops Secure cookies, so local HTTP will not keep the session across reload.
+- **SameSite=Lax** is set. The authenticator/Starlette stack supports SameSite, and Lax matches this site's framing. Caddy uses `frame-ancestors 'self'` and `X-Frame-Options: SAMEORIGIN` because `DENY` / `frame-ancestors 'none'` blocked the login cookie's iframe and dropped the session on reload. The claim request and a later reload are same-site, so Lax is stored and sent. SameSite=Strict would also survive a same-site reload but would drop the cookie when the app is opened from a cross-site link. SameSite=None is for a cross-origin embed, which this site is not, and CookieManager does not offer it. Streamlit's own auth cookies stay on Lax for the same reason.
+
+The route is inserted on the running server when the login page loads (ahead of Streamlit's static catch-all). Caddy already proxies the host, so `/ffis/login-cookie` needs no extra rule. `FFIS_AUTH_CONFIG` handling is unchanged, including the baked `auth_config.yaml` fallback when the env var is unset.
+
+### Manual check (browser reload)
+
+Automated tests cover the cap, a successful password login, and that the Set-Cookie value is the JWT the authenticator accepts on the next request. A full browser reload is not run from CI. After the app image is actually restarted (separate GO; do not do it as part of opening the PR):
+
+1. Open `https://mdkappsvr.tailea9f4f.ts.net:8443` over HTTPS. Do not use plain HTTP.
+2. Sign in with the normal account.
+3. In DevTools → Application → Cookies for that host, the login cookie (name from the auth config, normally `ffis_auth`) shows Secure, HttpOnly, and SameSite=Lax.
+4. Reload the page. The sidebar still shows the signed-in user, not the login form.
+5. Log out, reload, and confirm the login form is back.
+6. Submit a wrong password 5 times. The form is replaced by the lockout message. Restart the app process to clear it; do not restart ingest.
